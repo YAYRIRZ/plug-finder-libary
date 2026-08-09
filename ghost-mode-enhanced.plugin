@@ -1,0 +1,372 @@
+"""
+Exteragram Ghost Mode Plugin
+Advanced privacy plugin for appearing offline and blocking typing indicators
+"""
+
+# ============================================================================
+# PLUGIN METADATA
+# ============================================================================
+__id__ = "ghost-mode-enhanced"
+__name__ = "Ghost Mode"
+__description__ = "Stay invisible while using Telegram"
+__author__ = "@exteraStar"
+__version__ = "1.4.0"
+__icon__ = "exteraPlugins/1"
+__min_version__ = "11.12.0"
+
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.settings import Switch, Header
+from ui.bulletin import BulletinHelper
+from android_utils import log, run_on_ui_thread
+from typing import Any
+
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+# Telegram API requests that send typing indicators
+TYPING_REQUESTS = [
+    "TL_messages_setTyping",         # Regular chats typing indicator
+    "TL_messages_setEncryptedTyping"  # Secret chats typing indicator
+]
+
+# Requests that control online/offline status
+# IMPORTANT: Multiple requests can trigger status updates!
+STATUS_REQUESTS = [
+    "TL_account_updateStatus",       # Main status update request
+    "TL_messages_sendMessage",       # Sending messages can update status
+    "TL_messages_sendMedia",         # Sending media can update status
+    "TL_messages_sendMultiMedia",    # Sending multiple media
+    "TL_messages_editMessage",       # Editing messages
+    "TL_messages_getHistory",        # Getting message history
+    "TL_messages_readHistory",       # Reading messages (also status trigger)
+]
+
+# Request for read receipts (marking messages as read)
+READ_RECEIPTS_REQUEST = "TL_messages_readHistory"
+
+
+# ============================================================================
+# MAIN PLUGIN CLASS
+# ============================================================================
+class GhostModePlugin(BasePlugin):
+    """
+    Ghost Mode Plugin - Enhanced privacy controls for Telegram
+    
+    Features:
+    - Blocks typing indicators in all chat types
+    - Forces offline status when enabled
+    - Optional read receipts blocking
+    - Real-time notifications and statistics
+    """
+    
+    def __init__(self):
+        super().__init__()
+        # Statistics tracking
+        self.typing_blocked_count = 0
+        self.status_forced_count = 0
+        self.session_active = False
+    
+    
+    # ========================================================================
+    # LIFECYCLE METHODS
+    # ========================================================================
+    
+    def on_plugin_load(self):
+        """
+        Called when plugin is loaded/enabled
+        Registers all necessary hooks for ghost mode functionality
+        """
+        try:
+            # Register hooks for typing indicators
+            for request_name in TYPING_REQUESTS:
+                self.add_hook(request_name)
+                self.log(f"Registered hook for: {request_name}")
+            
+            # Register hooks for ALL status-related requests
+            for request_name in STATUS_REQUESTS:
+                self.add_hook(request_name)
+                self.log(f"Registered hook for: {request_name}")
+            
+            # Reset session statistics
+            self.typing_blocked_count = 0
+            self.status_forced_count = 0
+            self.session_active = True
+            
+            # Show welcome notification if enabled
+            if self.get_setting("show_notifications", True):
+                self._show_activation_status()
+            
+            self.log("Ghost Mode plugin loaded successfully")
+            
+        except Exception as e:
+            self.log(f"Error loading plugin: {str(e)}")
+            BulletinHelper.show_error(f"Ghost Mode failed to load: {str(e)}")
+    
+    
+    def on_plugin_unload(self):
+        """
+        Called when plugin is disabled/unloaded
+        Cleanup and show final statistics
+        """
+        try:
+            if self.session_active and self.get_setting("show_notifications", True):
+                # Show session summary
+                summary = f"Ghost Mode deactivated\n"
+                if self.typing_blocked_count > 0:
+                    summary += f"🚫 {self.typing_blocked_count} typing indicators blocked\n"
+                if self.status_forced_count > 0:
+                    summary += f"👻 {self.status_forced_count} status updates forced offline"
+                
+                BulletinHelper.show_info(summary)
+            
+            self.session_active = False
+            self.log("Ghost Mode plugin unloaded")
+            
+        except Exception as e:
+            self.log(f"Error unloading plugin: {str(e)}")
+    
+    
+    # ========================================================================
+    # HOOK HANDLERS
+    # ========================================================================
+    
+    def pre_request_hook(self, request_name: str, account: int, request: Any) -> HookResult:
+        """
+        Intercept Telegram API requests before they're sent
+        
+        Args:
+            request_name: Name of the Telegram API request
+            account: Account ID making the request
+            request: The actual request object
+            
+        Returns:
+            HookResult with strategy (DEFAULT, CANCEL, or MODIFY)
+        """
+        try:
+            # Debug mode - log ALL requests to help identify what's causing online status
+            if self.get_setting("debug_mode", False):
+                # Check if this request might affect status
+                if "message" in request_name.lower() or "status" in request_name.lower():
+                    self.log(f"🔍 DEBUG: {request_name} - offline={getattr(request, 'offline', 'N/A')}")
+            
+            # ================================================================
+            # TYPING INDICATOR BLOCKING
+            # ================================================================
+            if request_name in TYPING_REQUESTS:
+                if self.get_setting("block_typing", True):
+                    self.typing_blocked_count += 1
+                    self.log(f"🚫 Blocked typing indicator: {request_name} (Total: {self.typing_blocked_count})")
+                    
+                    # Show notification for first few blocks or periodically
+                    if self.get_setting("show_notifications", True):
+                        if self.typing_blocked_count <= 3 or self.typing_blocked_count % 10 == 0:
+                            self._show_typing_blocked_notification()
+                    
+                    # Cancel the request - typing indicator won't be sent
+                    return HookResult(strategy=HookStrategy.CANCEL)
+            
+            
+            # ================================================================
+            # ONLINE/OFFLINE STATUS FORCING
+            # CRITICAL FIX: Cancel ANY attempt to set us online, don't just modify
+            # ================================================================
+            if request_name in STATUS_REQUESTS:
+                if self.get_setting("force_offline", True):
+                    
+                    # For direct status update request - CANCEL if trying to set online
+                    if request_name == "TL_account_updateStatus":
+                        original_offline = getattr(request, 'offline', None)
+                        
+                        # If Telegram is trying to set us ONLINE (offline=False), BLOCK IT
+                        if original_offline is False or original_offline is None:
+                            self.status_forced_count += 1
+                            self.log(f"👻 BLOCKED online status update (was trying: offline={original_offline})")
+                            
+                            if self.get_setting("show_notifications", True) and self.status_forced_count == 1:
+                                BulletinHelper.show_success("👻 Appearing offline")
+                            
+                            # CANCEL the request entirely - don't even send it
+                            return HookResult(strategy=HookStrategy.CANCEL)
+                        
+                        # If it's already trying to set us offline (offline=True), let it through
+                        elif original_offline is True:
+                            if self.get_setting("debug_mode", False):
+                                self.log(f"✓ Allowing offline status update (already offline=True)")
+                            return HookResult(strategy=HookStrategy.DEFAULT)
+                    
+                    # For message-sending and other requests that trigger status updates
+                    # We need to ensure they don't automatically set us online
+                    else:
+                        # These requests might have a flag or we may need to send a follow-up offline status
+                        # Log it so we know it's being monitored
+                        if self.get_setting("debug_mode", False):
+                            self.log(f"👻 Monitoring status-sensitive request: {request_name}")
+                        
+                        # The strategy here is to let the request through but log it
+                        # The actual offline status is maintained by blocking TL_account_updateStatus
+                        # when it tries to set us online
+            
+            
+            # ================================================================
+            # READ RECEIPTS BLOCKING (Experimental)
+            # ================================================================
+            if request_name == READ_RECEIPTS_REQUEST:
+                if self.get_setting("block_read_receipts", False):
+                    self.log(f"🚫 Blocked read receipt: {request_name}")
+                    
+                    if self.get_setting("show_notifications", True):
+                        BulletinHelper.show_info("📖 Read receipt blocked")
+                    
+                    # Cancel the request - message won't be marked as read
+                    return HookResult(strategy=HookStrategy.CANCEL)
+            
+            
+        except Exception as e:
+            self.log(f"Error in pre_request_hook: {str(e)}")
+            # On error, use default behavior to avoid breaking functionality
+        
+        # Default behavior - let the request proceed normally
+        return HookResult(strategy=HookStrategy.DEFAULT)
+    
+    
+    def post_request_hook(self, request_name: str, account: int, response: Any, error: Any) -> HookResult:
+        """
+        Called AFTER request completes - use this to force offline status
+        after message-sending operations that might trigger online status
+        
+        Args:
+            request_name: Name of the completed request
+            account: Account ID
+            response: Response from server (if successful)
+            error: Error object (if failed)
+            
+        Returns:
+            HookResult (usually DEFAULT)
+        """
+        try:
+            # After sending messages or interacting, Telegram might auto-set us online
+            # We need to immediately force offline status again
+            if self.get_setting("force_offline", True):
+                # List of requests that commonly trigger automatic online status
+                MESSAGE_OPERATIONS = [
+                    "TL_messages_sendMessage",
+                    "TL_messages_sendMedia",
+                    "TL_messages_sendMultiMedia",
+                    "TL_messages_editMessage",
+                ]
+                
+                if request_name in MESSAGE_OPERATIONS:
+                    # Only if the request was successful
+                    if error is None:
+                        self.log(f"👻 Message sent via {request_name} - maintaining offline status")
+                        # The offline status will be maintained by the pre_request_hook
+                        # catching any subsequent TL_account_updateStatus calls
+                        
+        except Exception as e:
+            self.log(f"Error in post_request_hook: {str(e)}")
+        
+        return HookResult(strategy=HookStrategy.DEFAULT)
+    
+    
+    # ========================================================================
+    # SETTINGS UI
+    # ========================================================================
+    
+    def create_settings(self) -> list:
+        """
+        Create the settings UI for Ghost Mode
+        
+        Returns:
+            List of UI elements (Headers, Switches, etc.)
+        """
+        return [
+            # Main header
+            Header(text="👻 Ghost Mode Settings"),
+            
+            # Typing indicator control
+            Switch(
+                key="block_typing",
+                text="🚫 Block typing indicators",
+                default=True
+            ),
+            
+            # Online/offline status control
+            Switch(
+                key="force_offline",
+                text="👻 Always appear offline",
+                default=True
+            ),
+            
+            # Read receipts control (experimental)
+            Header(text="⚙️ Advanced Options"),
+            Switch(
+                key="block_read_receipts",
+                text="📖 Block read receipts (Experimental)",
+                default=False
+            ),
+            
+            # Debug mode for troubleshooting
+            Switch(
+                key="debug_mode",
+                text="🔍 Debug mode (verbose logging)",
+                default=False
+            ),
+            
+            # Notification preferences
+            Header(text="🔔 Notifications"),
+            Switch(
+                key="show_notifications",
+                text="📱 Show activity notifications",
+                default=True
+            ),
+        ]
+    
+    
+    # ========================================================================
+    # HELPER METHODS
+    # ========================================================================
+    
+    def _show_activation_status(self):
+        """Show which ghost mode features are currently active"""
+        active_features = []
+        
+        if self.get_setting("block_typing", True):
+            active_features.append("🚫 Typing hidden")
+        
+        if self.get_setting("force_offline", True):
+            active_features.append("👻 Status offline")
+        
+        if self.get_setting("block_read_receipts", False):
+            active_features.append("📖 Receipts blocked")
+        
+        if active_features:
+            message = "Ghost Mode Active:\n" + "\n".join(active_features)
+            run_on_ui_thread(lambda: BulletinHelper.show_success(message))
+        else:
+            run_on_ui_thread(lambda: BulletinHelper.show_info("Ghost Mode enabled (no features active)"))
+    
+    
+    def _show_typing_blocked_notification(self):
+        """Show notification when typing indicator is blocked"""
+        count = self.typing_blocked_count
+        
+        if count == 1:
+            message = "🚫 Typing indicator blocked"
+        elif count <= 5:
+            message = f"🚫 {count} typing indicators blocked"
+        else:
+            message = f"🚫 {count} typing indicators blocked this session"
+        
+        run_on_ui_thread(lambda: BulletinHelper.show_info(message))
+
+
+# ============================================================================
+# PLUGIN EXPORT
+# ============================================================================
+# This line is required for Exteragram to load the plugin
+plugin = GhostModePlugin()

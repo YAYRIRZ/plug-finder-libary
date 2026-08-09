@@ -1,0 +1,3267 @@
+r"""
+ _____                                                             _____
+( ___ )-----------------------------------------------------------( ___ )
+ |   |                                                             |   |
+ |   | _ _ _ _ ___ _  _    _    ____ _  _ ____    ___  _   _       |   |
+ |   | | | | |  |  |__|    |    |  | |  | |___    |__]  \_/        |   |
+ |   | |_|_| |  |  |  |    |___ |__|  \/  |___    |__]   |         |   |
+ |   |                                                             |   |
+ |   | _  _ _ _  _ ____ _ _    _  _ ____ ___ ____ _  _ ____ _  _ _ |   |
+ |   | |\/| | |__| |__| | |    |_/  |  |  |  |  | |  | [__  |_/  | |   |
+ |   | |  | | |  | |  | | |___ | \_ |__|  |  |__|  \/  ___] | \_ | |   |
+ |___|                                                             |___|
+(_____)-----------------------------------------------------------(_____)
+
+Копирование кода без указания авторства является публичным неуважением к работе @itskotovski
+"""
+
+__id__ = "buy_gifts"
+__name__ = "Gift"
+__description__ = "скрытые подарки в списке гифтов + нативный выбор количества и получателей для массовой отправки"
+__author__ = "@itskotovski"
+__version__ = "3.0 [reimagined]"
+__icon__ = "DMJDuckX/0"
+
+import random
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from base_plugin import BasePlugin, MethodHook
+from client_utils import (
+    RequestCallback,
+    get_last_fragment,
+    get_messages_controller,
+    get_user_config,
+    send_request,
+)
+from android_utils import OnClickListener, R, run_on_ui_thread
+from hook_utils import find_class, get_private_field
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from org.telegram.messenger import MediaDataController
+from org.telegram.messenger import R as R_tg
+from org.telegram.tgnet import TLRPC
+from org.telegram.tgnet.tl import TL_stars
+from java import dynamic_proxy, jarray, jclass, jint
+from java.lang import Integer
+from java.util import ArrayList
+
+_TEXTS: Dict[str, str] = {
+    "cancel_button": "Отмена",
+    "no_context": "Не удалось получить активное окно Telegram.",
+    "error_usage_limited": "Ограничение Telegram: {code}",
+    "error_with_code": "Ошибка отправки: {code}",
+    "gift_ribbon": "скрытый",
+    "send_quantity_label": "Количество",
+    "send_quantity_title": "Количество подарков",
+    "send_quantity_value": "×{quantity}",
+    "send_quantity_hint": "Подарки уходят по одному, с небольшой паузой. **Ввести количество вручную**",
+    "send_quantity_picker_info": "Доступный диапазон: {min} - {max}",
+    "send_quantity_apply": "Готово",
+    "send_quantity_limited": "Лимит Telegram для этого подарка: {limit}",
+    "send_quantity_progress": "Отправлено {current}/{total} · нажмите, чтобы остановить",
+    "send_quantity_partial": "Отправлено {done} из {total}",
+    "send_stopped": "Остановлено: {done} из {total}",
+    "send_done_title": "Отправлено {gifts}",
+    "send_done_subtitle": "Списано {stars} ⭐",
+    "recipients_label": "Получатели",
+    "recipients_current": "текущий чат",
+    "recipients_count": "{count} чат(ов)",
+    "recipients_picker_unavailable": "Выбор чатов недоступен в этой сборке.",
+    "recipients_picker_error": "Не удалось открыть выбор чатов.",
+    "balance_low_title": "Не хватает Stars",
+    "balance_low_text": "Нужно {need} ⭐, на балансе {balance} ⭐.",
+    "flood_wait": "Telegram просит подождать {seconds} с…",
+    "cfg_chip": "Конфиг",
+    "cfg_title": "Конфиг",
+    "cfg_open_error": "Не удалось открыть конфиг.",
+    "cfg_gifts_header": "Скрытые подарки",
+    "cfg_gift_value": "{stars} ⭐ · {pack}#{index}",
+    "cfg_gift_add": "Добавить подарок",
+    "cfg_gifts_empty": "Своих подарков пока нет. Добавьте gift_id — он появится в списке рядом со встроенными.",
+    "cfg_gifts_hint": "Нажмите на подарок, чтобы изменить или удалить его. То же работает долгим нажатием прямо в списке подарков.",
+    "cfg_send_header": "Отправка",
+    "cfg_ribbon": "Лента «скрытый»",
+    "cfg_remember": "Запоминать количество",
+    "cfg_haptic": "Вибро-отклик",
+    "cfg_delay": "Пауза между подарками",
+    "cfg_delay_value": "{value} мс",
+    "cfg_delay_off": "без паузы",
+    "cfg_max_quantity": "Максимум за раз",
+    "cfg_send_hint": "Пауза защищает от флуд-лимита Telegram. Изменения применяются сразу.",
+    "editor_title_new": "Новый подарок",
+    "editor_title_edit": "Подарок",
+    "editor_id_hint": "gift_id",
+    "editor_price_hint": "Цена в звёздах",
+    "editor_pack_hint": "Стикерпак",
+    "editor_index": "Стикер",
+    "editor_index_value": "#{index}",
+    "editor_index_title": "Индекс стикера",
+    "editor_index_info": "Пак: {pack}\nДоступно: 0 - {max_index}",
+    "editor_index_apply": "Выбрать",
+    "editor_save": "Сохранить",
+    "editor_delete": "Удалить подарок",
+    "editor_missing_id": "Введите корректный gift_id.",
+    "editor_saved": "Список подарков обновлён.",
+    "editor_removed": "Подарок удалён из списка.",
+    "editor_pack_loading": "Загружаю стикерпак, выбор откроется автоматически.",
+    "editor_pack_error": "Не удалось загрузить стикерпак {pack}.",
+}
+
+_BUILTIN_GIFT_PACK = "UnlimGifts_by_MoiStikiBot"
+_CUSTOM_GIFT_PACK = "HotCherry"
+_CUSTOM_GIFT_STICKER = 3
+_CUSTOM_GIFT_DEFAULT_STARS = 50
+
+_CONFIG_GIFT_ID = 9223372036854770001
+_CONFIG_GIFT_PACK = "EmojiAnimations"
+_CONFIG_GIFT_STICKER_MIN = 0
+_CONFIG_GIFT_STICKER_MAX = 100
+
+_SETTING_CUSTOM_IDS = "custom_gift_ids"
+_SETTING_RIBBON = "show_ribbon"
+_SETTING_DELAY = "send_delay_ms"
+_SETTING_MAX_QUANTITY = "max_quantity"
+_SETTING_REMEMBER = "remember_quantity"
+_SETTING_HAPTIC = "haptic_feedback"
+_SETTING_LAST_QUANTITY = "last_quantity"
+
+_DEFAULT_DELAY_MS = 350
+_DEFAULT_MAX_QUANTITY = 100
+_MAX_QUANTITY_CEILING = 9999
+_FLOOD_RETRIES = 3
+
+_SEND_SHEET_QTY_HEADER_ID = 41000
+_SEND_SHEET_QTY_ITEM_ID = 41001
+_SEND_SHEET_RECIPIENTS_ID = 41002
+_SEND_SHEET_QTY_SHADOW_ID = 41003
+_QTY_STEPS = (1, 2, 3, 5, 10, 15, 25, 50, 100, 250, 500, 1000)
+
+_CFG_GIFTS_HEADER_ID = 42000
+_CFG_GIFT_ADD_ID = 42001
+_CFG_GIFTS_SHADOW_ID = 42002
+_CFG_SEND_HEADER_ID = 42003
+_CFG_RIBBON_ID = 42004
+_CFG_REMEMBER_ID = 42005
+_CFG_HAPTIC_ID = 42006
+_CFG_DELAY_HEADER_ID = 42007
+_CFG_DELAY_ID = 42008
+_CFG_MAX_QUANTITY_HEADER_ID = 42009
+_CFG_MAX_QUANTITY_ID = 42010
+_CFG_SEND_SHADOW_ID = 42011
+_CFG_GIFT_BASE_ID = 43000
+
+_CFG_DELAY_STEPS = (0, 100, 200, 350, 500, 750, 1000, 1500, 2000, 3000)
+_CFG_MAX_QUANTITY_STEPS = (10, 25, 50, 100, 250, 500, 1000, 2500, 5000, _MAX_QUANTITY_CEILING)
+
+_DIALOGS_TYPE_FORWARD = 3
+_JAVA_INT_MAX = 2147483647
+
+_BUILTIN_GIFT_SPECS = (
+    {
+        "id": 5956217000635139069,
+        "stars": 50,
+        "sticker_number": 0,
+        "pack": _BUILTIN_GIFT_PACK,
+    },
+    {
+        "id": 5922558454332916696,
+        "stars": 50,
+        "sticker_number": 1,
+        "pack": _BUILTIN_GIFT_PACK,
+    },
+    {
+        "id": 5801108895304779062,
+        "stars": 50,
+        "sticker_number": 2,
+        "pack": _BUILTIN_GIFT_PACK,
+    },
+    {
+        "id": 5800655655995968830,
+        "stars": 50,
+        "sticker_number": 3,
+        "pack": _BUILTIN_GIFT_PACK,
+    },
+)
+_BUILTIN_GIFT_SPECS_BY_ID = {int(spec["id"]): spec for spec in _BUILTIN_GIFT_SPECS}
+_CONFIG_GIFT_SPEC = {
+    "id": _CONFIG_GIFT_ID,
+    "title": "Конфиг",
+    "stars": 0,
+    "sticker_number": _CONFIG_GIFT_STICKER_MIN,
+    "pack": _CONFIG_GIFT_PACK,
+}
+
+@dataclass
+class _SendSheetState:
+    quantity: int = 1
+    sending: bool = False
+    cancelled: bool = False
+    sent: int = 0
+    requested: int = 1
+    spent: int = 0
+    detached: bool = False
+    quantity_row: Any = None
+    recipients_row: Any = None
+    slide_options: Any = None
+    slide_options_max: int = 0
+    slide_callbacks: Any = None
+    recipients: List[int] = field(default_factory=list)
+
+class _SheetHook(MethodHook):
+    def __init__(self, plugin: "GiftPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param: Any) -> None:
+        try:
+            self.plugin._patch_sheet(
+                getattr(param, "thisObject", None),
+                getattr(param, "args", None),
+            )
+        except Exception as e:
+            self.plugin.log(f"fillItems hook error: {e}")
+
+class _GiftCellHook(MethodHook):
+    def __init__(self, plugin: "GiftPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param: Any) -> None:
+        try:
+            args = getattr(param, "args", None)
+            gift = args[0] if args and len(args) > 0 else None
+            self.plugin._apply_gift_ribbon(getattr(param, "thisObject", None), gift)
+        except Exception as e:
+            self.plugin.log(f"gift cell hook error: {e}")
+
+class _SendSheetShowHook(MethodHook):
+    def __init__(self, plugin: "GiftPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        try:
+            if self.plugin._maybe_open_config(getattr(param, "thisObject", None)):
+                param.setResult(None)
+        except Exception as e:
+            self.plugin.log(f"send sheet show hook error: {e}")
+
+class _SendSheetItemsHook(MethodHook):
+    def __init__(self, plugin: "GiftPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param: Any) -> None:
+        try:
+            self.plugin._patch_send_sheet_items(
+                getattr(param, "thisObject", None),
+                getattr(param, "args", None),
+            )
+        except Exception as e:
+            self.plugin.log(f"send sheet items hook error: {e}")
+
+class _SendSheetButtonHook(MethodHook):
+    def __init__(self, plugin: "GiftPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param: Any) -> None:
+        try:
+            args = getattr(param, "args", None)
+            animated = bool(args[0]) if args and len(args) > 0 else False
+            self.plugin._apply_send_sheet_button_text(getattr(param, "thisObject", None), animated)
+        except Exception as e:
+            self.plugin.log(f"send sheet button hook error: {e}")
+
+class _SendSheetBuyHook(MethodHook):
+    def __init__(self, plugin: "GiftPlugin"):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        try:
+            if self.plugin._intercept_send_sheet_bulk_buy(getattr(param, "thisObject", None)):
+                param.setResult(None)
+        except Exception as e:
+            self.plugin.log(f"send sheet buy hook error: {e}")
+
+class _SendSheetDetachHook(MethodHook):
+    def __init__(self, plugin: "GiftPlugin"):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param: Any) -> None:
+        try:
+            self.plugin._clear_send_sheet_state(getattr(param, "thisObject", None))
+        except Exception as e:
+            self.plugin.log(f"send sheet detach hook error: {e}")
+
+class GiftPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._hook_refs: List[Any] = []
+        self._gift_cache: Dict[int, Any] = {}
+        self._pack_docs: Dict[str, List[Any]] = {}
+        self._loading_packs = set()
+        self._gift_sheet = None
+        self._star_gift_factory_arity = None
+        self._send_sheet_states: Dict[int, _SendSheetState] = {}
+        self._picker_delegates: List[Any] = []
+        self._custom_ids_raw: Optional[str] = None
+        self._custom_specs_cache: List[Dict[str, Any]] = []
+        self._config_sheet = None
+        self._config_recycler = None
+        self._config_provider = None
+        self._config_refs: List[Any] = []
+        self._config_slides: Dict[str, Dict[str, Any]] = {}
+        self._config_gift_ids: List[int] = []
+        self._editor_sheet = None
+        self._editor_refs: List[Any] = []
+        self._pending_pack_picker: Optional[Dict[str, Any]] = None
+
+    def on_plugin_load(self):
+        try:
+            self._hook_sheet()
+            self._hook_gift_cell()
+            self._hook_send_sheet()
+            self._load_pack(_BUILTIN_GIFT_PACK)
+            self._load_pack(_CONFIG_GIFT_PACK)
+            self._preload_custom_gift_packs()
+        except Exception as e:
+            self.log(f"on_plugin_load error: {e}")
+
+    def on_plugin_unload(self):
+        try:
+            for state in list(self._send_sheet_states.values()):
+                state.cancelled = True
+            for ref in list(self._hook_refs):
+                try:
+                    self.unhook_method(ref)
+                except Exception:
+                    pass
+            self._hook_refs.clear()
+            self._dismiss_config_sheet()
+            self._dismiss_editor_sheet()
+            self._gift_sheet = None
+            self._send_sheet_states.clear()
+            self._picker_delegates.clear()
+            self._config_slides.clear()
+            self._config_refs.clear()
+            self._editor_refs.clear()
+            self._pending_pack_picker = None
+        except Exception as e:
+            self.log(f"unload error: {e}")
+
+    def _sync_custom_gifts(self):
+        raw = str(self.get_setting(_SETTING_CUSTOM_IDS, "") or "")
+        if raw == self._custom_ids_raw:
+            return
+        self._custom_ids_raw = raw
+        self._custom_specs_cache = self._parse_custom_gift_specs(raw)
+
+        keep = {int(spec["id"]) for spec in self._custom_specs_cache}
+        for gift_id in list(self._gift_cache.keys()):
+            if int(gift_id) not in _BUILTIN_GIFT_SPECS_BY_ID and int(gift_id) not in keep:
+                self._gift_cache.pop(gift_id, None)
+        self._preload_custom_gift_packs()
+
+    def _hook_sheet(self):
+        try:
+            cls = find_class("org.telegram.ui.Gifts.GiftSheet")
+            if cls is None:
+                self.log("GiftSheet class not found")
+                return
+
+            hooked = 0
+            for method in self._iter_declared_methods(cls):
+                try:
+                    if method.getName() != "fillItems":
+                        continue
+                    params = method.getParameterTypes()
+                    if len(params) != 2:
+                        continue
+                    if "java.util.ArrayList" not in str(params[0]):
+                        continue
+                    if "UniversalAdapter" not in str(params[1]):
+                        continue
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    ref = self.hook_method(method, _SheetHook(self), priority=2147483647)
+                    if ref is not None:
+                        self._hook_refs.append(ref)
+                        hooked += 1
+                except Exception:
+                    pass
+
+            if hooked == 0:
+                self.log("GiftSheet.fillItems hook was not installed")
+        except Exception as e:
+            self.log(f"_hook_sheet error: {e}")
+
+    def _hook_gift_cell(self):
+        try:
+            cls = find_class("org.telegram.ui.Gifts.GiftSheet$GiftCell")
+            if cls is None:
+                self.log("GiftCell class not found")
+                return
+
+            hooked = 0
+            for method in self._iter_declared_methods(cls):
+                try:
+                    if method.getName() != "setStarsGift":
+                        continue
+                    params = method.getParameterTypes()
+                    if len(params) < 1:
+                        continue
+                    first_param = str(params[0])
+                    if "SavedStarGift" in first_param:
+                        continue
+                    if "StarGift" not in first_param:
+                        continue
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    ref = self.hook_method(method, _GiftCellHook(self), priority=2147483647)
+                    if ref is not None:
+                        self._hook_refs.append(ref)
+                        hooked += 1
+                except Exception:
+                    pass
+
+            if hooked == 0:
+                self.log("GiftCell.setStarsGift hook was not installed")
+        except Exception as e:
+            self.log(f"_hook_gift_cell error: {e}")
+
+    def _hook_send_sheet(self):
+        try:
+            cls = find_class("org.telegram.ui.Gifts.SendGiftSheet")
+            if cls is None:
+                self.log("SendGiftSheet class not found")
+                return
+
+            hooked = {
+                "show": 0,
+                "fillItems": 0,
+                "setButtonText": 0,
+                "buyStarGift": 0,
+                "onDetachedFromWindow": 0,
+            }
+            for method in self._iter_declared_methods(cls):
+                try:
+                    name = str(method.getName())
+                    params = method.getParameterTypes()
+                    try:
+                        method.setAccessible(True)
+                    except Exception:
+                        pass
+                    hook_impl = None
+                    if name == "show" and len(params) == 0:
+                        hook_impl = _SendSheetShowHook(self)
+                    elif name == "fillItems" and len(params) == 2 and "java.util.ArrayList" in str(params[0]) and "UniversalAdapter" in str(params[1]):
+                        hook_impl = _SendSheetItemsHook(self)
+                    elif name == "setButtonText" and len(params) == 1 and str(params[0]) == "boolean":
+                        hook_impl = _SendSheetButtonHook(self)
+                    elif name == "buyStarGift" and len(params) == 0:
+                        hook_impl = _SendSheetBuyHook(self)
+                    elif name == "onDetachedFromWindow" and len(params) == 0:
+                        hook_impl = _SendSheetDetachHook(self)
+                    if hook_impl is None:
+                        continue
+                    ref = self.hook_method(method, hook_impl, priority=2147483647)
+                    if ref is not None:
+                        self._hook_refs.append(ref)
+                        hooked[name] += 1
+                except Exception:
+                    pass
+
+            if sum(hooked.values()) == 0:
+                self.log("SendGiftSheet hooks were not installed")
+        except Exception as e:
+            self.log(f"_hook_send_sheet error: {e}")
+
+    def _iter_declared_methods(self, cls_obj: Any) -> List[Any]:
+        try:
+            return list(cls_obj.getClass().getDeclaredMethods())
+        except Exception:
+            pass
+        try:
+            return list(cls_obj.getDeclaredMethods())
+        except Exception:
+            return []
+
+    def _preload_custom_gift_packs(self):
+        seen = set()
+        for spec in self._custom_gift_specs():
+            pack_name = self._custom_pack_name(spec.get("pack", ""))
+            if not pack_name or pack_name in seen:
+                continue
+            seen.add(pack_name)
+            self._load_pack(pack_name)
+
+    def _load_pack(self, pack_name: str):
+        if not pack_name or pack_name in self._loading_packs or self._pack_docs.get(pack_name):
+            return
+
+        current_account = self._current_account()
+        try:
+            media = MediaDataController.getInstance(int(current_account))
+            cached_set = media.getStickerSetByName(pack_name)
+            docs = self._extract_pack_docs(cached_set)
+            if docs:
+                self._pack_docs[pack_name] = docs
+                self._refresh_gift_docs()
+                return
+        except Exception as e:
+            self.log(f"sticker pack cache lookup error: {e}")
+
+        self._request_pack(pack_name, int(current_account))
+
+    def _request_pack(self, pack_name: str, current_account: int):
+        if not pack_name or pack_name in self._loading_packs:
+            return
+        self._loading_packs.add(pack_name)
+
+        try:
+            req = TLRPC.TL_messages_getStickerSet()
+            input_set = TLRPC.TL_inputStickerSetShortName()
+            input_set.short_name = pack_name
+            req.stickerset = input_set
+            req.hash = self._as_java_long(0)
+        except Exception as e:
+            self._loading_packs.discard(pack_name)
+            self.log(f"sticker pack request build error: {e}")
+            return
+
+        def on_result(response: Any, error: Any):
+            self._loading_packs.discard(pack_name)
+            if error is not None:
+                try:
+                    text = str(getattr(error, "text", "") or getattr(error, "error_message", "") or error)
+                except Exception:
+                    text = str(error)
+                self.log(f"sticker pack fetch error: {text}")
+                run_on_ui_thread(lambda: self._on_pack_failed(pack_name))
+                return
+
+            docs = self._extract_pack_docs(response)
+            if not docs:
+                run_on_ui_thread(lambda: self._on_pack_failed(pack_name))
+                return
+
+            self._pack_docs[pack_name] = docs
+            self._refresh_gift_docs()
+            run_on_ui_thread(lambda: self._after_pack_loaded(pack_name))
+
+        try:
+            send_request(req, RequestCallback(on_result))
+        except Exception as e:
+            self._loading_packs.discard(pack_name)
+            self.log(f"sticker pack request error: {e}")
+
+    def _extract_pack_docs(self, response: Any) -> List[Any]:
+        docs = getattr(response, "documents", None) if response is not None else None
+        if docs is None:
+            return []
+        return self._iter_java_items(docs)
+
+    def _pack_sticker(self, pack_name: str, sticker_number: Any):
+        docs = self._pack_docs.get(pack_name) or []
+        if not docs:
+            return None
+        try:
+            index = int(sticker_number)
+        except Exception:
+            index = -1
+        if 0 <= index < len(docs):
+            return docs[index]
+        return docs[0]
+
+    def _refresh_gift_docs(self):
+        for gift_id, gift in list(self._gift_cache.items()):
+            spec = self._gift_spec(gift_id)
+            if spec is None or gift is None:
+                continue
+            try:
+                sticker = self._pack_sticker(
+                    str(spec.get("pack", _BUILTIN_GIFT_PACK) or _BUILTIN_GIFT_PACK),
+                    self._sticker_index(spec),
+                )
+                if sticker is not None:
+                    gift.sticker = sticker
+            except Exception:
+                pass
+
+    def _patch_sheet(self, sheet: Any, args: Any):
+        if sheet is None or args is None:
+            return
+
+        self._gift_sheet = sheet
+        self._bind_sheet_long_press(sheet)
+        items = self._get_at(args, 0)
+        if items is None or not self._can_patch_sheet(sheet):
+            return
+
+        existing_ids, insert_index = self._scan_sheet(items)
+        gift_items = self._build_sheet_items(
+            int(self._field(sheet, "TAB_ALL", -1) or -1),
+            existing_ids,
+        )
+        if not gift_items:
+            return
+
+        self._insert_items(items, insert_index, gift_items)
+
+    def _can_patch_sheet(self, sheet: Any) -> bool:
+        selected_tab = int(self._field(sheet, "selectedTab", -1) or -1)
+        tab_all = int(self._field(sheet, "TAB_ALL", -1) or -1)
+        if selected_tab != tab_all:
+            return False
+
+        if bool(self._field(sheet, "birthday", False)):
+            return False
+
+        user_settings = self._field(sheet, "userSettings", None)
+        try:
+            return not (user_settings is not None and bool(user_settings.disallow_unlimited_stargifts))
+        except Exception:
+            return True
+
+    def _scan_sheet(self, items: Any):
+        existing_ids = set()
+        insert_index = -1
+        size = int(items.size())
+
+        for index in range(size):
+            item = self._get_at(items, index)
+            if item is None:
+                continue
+            obj = getattr(item, "object", None)
+            gift_id = self._gift_id(obj)
+            if gift_id <= 0:
+                continue
+            existing_ids.add(gift_id)
+            if insert_index < 0 and self._is_gift(obj):
+                insert_index = index
+
+        if insert_index < 0:
+            insert_index = size
+        return existing_ids, insert_index
+
+    def _build_sheet_items(self, tab_all: int, existing_ids: set) -> List[Any]:
+        gift_factory = self._gift_item_factory()
+        if gift_factory is None:
+            return []
+
+        gift_items = []
+        for spec in self._gift_specs():
+            gift_id = int(spec["id"])
+            if gift_id in existing_ids:
+                continue
+
+            gift = self._custom_gift(gift_id)
+            if gift is None:
+                continue
+
+            try:
+                item = self._make_star_gift_item(gift_factory, tab_all, gift)
+                if item is not None:
+                    gift_items.append(item)
+            except Exception as e:
+                self.log(f"asStarGift failed for {gift_id}: {e}")
+        return gift_items
+
+    def _insert_items(self, items: Any, insert_index: int, new_items: List[Any]):
+        for offset, item in enumerate(new_items):
+            try:
+                items.add(int(insert_index + offset), item)
+            except Exception:
+                try:
+                    items.add(item)
+                except Exception as e:
+                    self.log(f"insert gift item failed: {e}")
+                    break
+
+    def _gift_item_factory(self):
+        try:
+            return jclass("org.telegram.ui.Gifts.GiftSheet$GiftCell$Factory")
+        except Exception:
+            return None
+
+    def _make_star_gift_item(self, gift_factory: Any, tab_all: int, gift: Any):
+        arity = self._resolve_star_gift_factory_arity(gift_factory)
+        try:
+            if arity == 6:
+                return gift_factory.asStarGift(tab_all, gift, False, False, False, False)
+            if arity == 7 or arity is None:
+                item = gift_factory.asStarGift(tab_all, gift, False, False, False, False, False)
+                if arity is None:
+                    self._star_gift_factory_arity = 7
+                return item
+        except Exception:
+            pass
+
+        for args in (
+            (tab_all, gift, False, False, False, False),
+            (tab_all, gift, False, False, False, False, False),
+        ):
+            try:
+                item = gift_factory.asStarGift(*args)
+                if self._star_gift_factory_arity is None:
+                    self._star_gift_factory_arity = len(args)
+                return item
+            except Exception:
+                pass
+        return None
+
+    def _resolve_star_gift_factory_arity(self, gift_factory: Any) -> Optional[int]:
+        cached = self._star_gift_factory_arity
+        if cached is not None:
+            return int(cached)
+
+        try:
+            for method in self._iter_declared_methods(gift_factory):
+                try:
+                    if method.getName() != "asStarGift":
+                        continue
+                    params = method.getParameterTypes()
+                    if len(params) < 3:
+                        continue
+                    second_param = str(params[1])
+                    if "SavedStarGift" in second_param:
+                        continue
+                    if "StarGift" not in second_param:
+                        continue
+                    self._star_gift_factory_arity = int(len(params))
+                    return int(len(params))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None
+
+    def _apply_gift_ribbon(self, cell: Any, gift: Any):
+        if cell is None:
+            return
+
+        gift_id = self._gift_id(gift)
+        if gift_id == _CONFIG_GIFT_ID:
+            self._tune_config_cell(cell)
+            return
+
+        if not self._setting_bool(_SETTING_RIBBON, True):
+            return
+        if gift_id <= 0 or self._gift_spec(gift_id) is None:
+            return
+
+        ribbon = self._field(cell, "ribbon", None)
+        if ribbon is None:
+            return
+
+        provider = self._field(cell, "resourcesProvider", None)
+        try:
+            ribbon.setVisibility(0)
+            try:
+                ribbon.setBackdrop(None)
+            except Exception:
+                pass
+            color = self._theme_color("key_gift_ribbon", provider)
+            if color:
+                ribbon.setColor(self._as_java_color(color))
+            try:
+                ribbon.setStrokeColor(0)
+            except Exception:
+                pass
+            ribbon.setText(self._t("gift_ribbon"), True)
+        except Exception as e:
+            self.log(f"ribbon apply error: {e}")
+
+    def _refresh_gift_sheet(self):
+        sheet = self._gift_sheet
+        if sheet is None:
+            return
+
+        adapter = self._field(sheet, "adapter", None)
+        if adapter is None:
+            return
+
+        try:
+            adapter.update(True)
+            return
+        except Exception:
+            pass
+
+        try:
+            adapter.notifyDataSetChanged()
+        except Exception:
+            pass
+
+    def _gift_spec(self, gift_id: Any):
+        try:
+            gift_id = int(gift_id)
+        except Exception:
+            return None
+        if gift_id == _CONFIG_GIFT_ID:
+            return _CONFIG_GIFT_SPEC
+        builtin = _BUILTIN_GIFT_SPECS_BY_ID.get(gift_id)
+        if builtin is not None:
+            return builtin
+        for spec in self._custom_gift_specs():
+            if int(spec["id"]) == gift_id:
+                return spec
+        return None
+
+    def _gift_specs(self) -> List[Dict[str, Any]]:
+        return [_CONFIG_GIFT_SPEC] + list(_BUILTIN_GIFT_SPECS) + self._custom_gift_specs()
+
+    def _custom_gift_specs(self) -> List[Dict[str, Any]]:
+        self._sync_custom_gifts()
+        return list(self._custom_specs_cache)
+
+    def _find_custom_spec(self, gift_id: Any) -> Optional[Dict[str, Any]]:
+        parsed = self._to_int(gift_id)
+        if parsed is None:
+            return None
+        for spec in self._custom_gift_specs():
+            if int(spec["id"]) == int(parsed):
+                return dict(spec)
+        return None
+
+    def _parse_custom_gift_specs(self, raw: str) -> List[Dict[str, Any]]:
+        if raw.strip() == "":
+            return []
+
+        specs: List[Dict[str, Any]] = []
+        seen = set()
+        for part in re.split(r"[\n,;]+", raw):
+            token = str(part).strip()
+            if token == "":
+                continue
+
+            gift_text = token
+            stars = _CUSTOM_GIFT_DEFAULT_STARS
+            pack_name = _CUSTOM_GIFT_PACK
+            sticker_number = _CUSTOM_GIFT_STICKER
+
+            if "|" in token:
+                chunks = [str(chunk).strip() for chunk in token.split("|")]
+                if chunks:
+                    gift_text = chunks[0]
+                if len(chunks) > 1 and chunks[1] != "":
+                    pack_name = self._custom_pack_name(chunks[1])
+                if len(chunks) > 2:
+                    parsed_index = self._to_int(chunks[2])
+                    if parsed_index is not None and parsed_index >= 0:
+                        sticker_number = int(parsed_index)
+
+            if ":" in gift_text:
+                gift_text, stars_text = gift_text.split(":", 1)
+                parsed_stars = self._to_int(stars_text)
+                if parsed_stars is not None and parsed_stars > 0:
+                    stars = parsed_stars
+
+            gift_id = self._to_int(gift_text)
+            if gift_id is None or gift_id <= 0:
+                continue
+            if gift_id in seen or gift_id in _BUILTIN_GIFT_SPECS_BY_ID or gift_id == _CONFIG_GIFT_ID:
+                continue
+
+            seen.add(gift_id)
+            specs.append(
+                {
+                    "id": int(gift_id),
+                    "stars": int(stars),
+                    "sticker_number": int(sticker_number),
+                    "pack": str(pack_name),
+                }
+            )
+        return specs
+
+    def _custom_pack_name(self, pack_name: Any) -> str:
+        pack_name = str(pack_name or "").strip()
+        return pack_name or _CUSTOM_GIFT_PACK
+
+    def _normalize_custom_sticker_index(self, sticker_number: Any) -> int:
+        parsed = self._to_int(sticker_number)
+        if parsed is None or parsed < 0:
+            return _CUSTOM_GIFT_STICKER
+        return int(parsed)
+
+    def _format_custom_gift_specs(self, specs: List[Dict[str, Any]]) -> str:
+        lines = []
+        for spec in specs:
+            gift_id = int(spec["id"])
+            stars = int(spec.get("stars", _CUSTOM_GIFT_DEFAULT_STARS) or _CUSTOM_GIFT_DEFAULT_STARS)
+            pack_name = self._custom_pack_name(spec.get("pack", _CUSTOM_GIFT_PACK))
+            sticker_number = self._normalize_custom_sticker_index(spec.get("sticker_number", _CUSTOM_GIFT_STICKER))
+
+            line = str(gift_id) if stars == _CUSTOM_GIFT_DEFAULT_STARS else f"{gift_id}:{stars}"
+            if pack_name != _CUSTOM_GIFT_PACK or sticker_number != _CUSTOM_GIFT_STICKER:
+                line = f"{line}|{pack_name}|{sticker_number}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _store_custom_gifts(self, specs: List[Dict[str, Any]]):
+        try:
+            self.set_setting(_SETTING_CUSTOM_IDS, self._format_custom_gift_specs(specs))
+        except Exception as e:
+            self.log(f"save custom gifts error: {e}")
+            return
+        self._sync_custom_gifts()
+        self._refresh_gift_sheet()
+        self._update_config_sheet()
+
+    def _gift_id(self, obj: Any) -> int:
+        if obj is None:
+            return 0
+        try:
+            return int(getattr(obj, "id", 0) or 0)
+        except Exception:
+            return 0
+
+    def _is_gift(self, obj: Any) -> bool:
+        if obj is None:
+            return False
+        try:
+            return self._gift_id(obj) > 0 and hasattr(obj, "stars")
+        except Exception:
+            return False
+
+    def _custom_gift(self, gift_id: int):
+        gift_id = int(gift_id)
+        cached = self._gift_cache.get(gift_id)
+        spec = self._gift_spec(gift_id)
+        if spec is None:
+            return None
+
+        if cached is not None:
+            self._fill_gift(cached, gift_id, spec)
+            return cached
+
+        gift_class = getattr(TL_stars, "TL_starGift", None)
+        if gift_class is None:
+            return None
+
+        pack_name = str(spec.get("pack", _BUILTIN_GIFT_PACK) or _BUILTIN_GIFT_PACK)
+        if not self._pack_docs.get(pack_name) and pack_name not in self._loading_packs:
+            self._load_pack(pack_name)
+
+        try:
+            gift = gift_class()
+            self._fill_gift(gift, gift_id, spec)
+            self._gift_cache[gift_id] = gift
+            return gift
+        except Exception as e:
+            self.log(f"gift build error for {gift_id}: {e}")
+            return None
+
+    def _fill_gift(self, gift: Any, gift_id: int, spec: Dict[str, Any]):
+        title = str(spec.get("title", "") or "")
+        gift.id = self._as_java_long(gift_id)
+        gift.title = title
+        gift.flags = 32 if title else 0
+        gift.stars = self._as_java_long(spec.get("stars", 50))
+        self._set_optional_star_gift_field(gift, "convert_stars", self._as_java_long(0))
+
+        for field_name in (
+            "limited",
+            "sold_out",
+            "birthday",
+            "require_premium",
+            "resale_ton_only",
+            "limited_per_user",
+            "peer_color_available",
+            "can_upgrade",
+            "auction",
+            "theme_available",
+            "burned",
+            "crafted",
+        ):
+            self._set_optional_star_gift_field(gift, field_name, False)
+
+        for field_name in (
+            "per_user_total",
+            "per_user_remains",
+            "locked_until_date",
+            "availability_remains",
+            "availability_total",
+            "gifts_per_round",
+            "offer_min_stars",
+            "auction_start_date",
+            "upgrade_variants",
+            "craft_chance_permille",
+            "num",
+            "first_sale_date",
+            "last_sale_date",
+        ):
+            self._set_optional_star_gift_field(gift, field_name, 0)
+
+        for field_name in (
+            "availability_resale",
+            "upgrade_stars",
+            "resell_min_stars",
+            "value_amount",
+            "value_usd_amount",
+        ):
+            self._set_optional_star_gift_field(gift, field_name, self._as_java_long(0))
+
+        for field_name in (
+            "slug",
+            "auction_slug",
+            "value_currency",
+            "owner_name",
+            "owner_address",
+            "gift_address",
+        ):
+            self._set_optional_star_gift_field(gift, field_name, "")
+
+        for field_name in (
+            "background",
+            "theme_peer",
+            "peer_color",
+            "host_id",
+            "owner_id",
+            "released_by",
+            "resell_amount",
+        ):
+            self._set_optional_star_gift_field(gift, field_name, None)
+
+        self._set_optional_star_gift_field(gift, "attributes", ArrayList())
+        self._bind_sticker(gift, gift_id)
+
+    def _bind_sticker(self, gift: Any, gift_id: int):
+        spec = self._gift_spec(gift_id)
+        if spec is None:
+            return
+        sticker = self._pack_sticker(
+            str(spec.get("pack", _BUILTIN_GIFT_PACK) or _BUILTIN_GIFT_PACK),
+            self._sticker_index(spec),
+        )
+        if sticker is not None:
+            self._set_optional_star_gift_field(gift, "sticker", sticker)
+
+    def _sticker_index(self, spec: Dict[str, Any]) -> int:
+        pack_name = str(spec.get("pack", "") or "")
+        if pack_name == _CONFIG_GIFT_PACK:
+            docs = self._pack_docs.get(pack_name) or []
+            if docs:
+                upper = min(_CONFIG_GIFT_STICKER_MAX, len(docs) - 1)
+                if upper >= _CONFIG_GIFT_STICKER_MIN:
+                    return random.randint(_CONFIG_GIFT_STICKER_MIN, upper)
+            return _CONFIG_GIFT_STICKER_MIN
+        return int(spec.get("sticker_number", -1) or -1)
+
+    def _patch_send_sheet_items(self, send_sheet: Any, args: Any):
+        if send_sheet is None or args is None or not self._can_bulk_send_gifts(send_sheet):
+            return
+
+        items = self._get_at(args, 0)
+        if items is None:
+            return
+
+        for existing_item in self._iter_java_items(items):
+            if self._to_int(getattr(existing_item, "id", 0)) in (_SEND_SHEET_QTY_ITEM_ID, _SEND_SHEET_RECIPIENTS_ID):
+                return
+
+        block = self._build_send_sheet_block(send_sheet)
+        if not block:
+            return
+
+        self._insert_send_sheet_block(send_sheet, items, block)
+
+    def _build_send_sheet_block(self, send_sheet: Any) -> List[Any]:
+        try:
+            UItem = jclass("org.telegram.ui.Components.UItem")
+        except Exception:
+            return []
+
+        block: List[Any] = []
+        with_quantity = self._send_sheet_max_quantity(send_sheet) > 1
+
+        if with_quantity:
+            try:
+                block.append(UItem.asHeader(_SEND_SHEET_QTY_HEADER_ID, self._t("send_quantity_label")))
+            except Exception:
+                pass
+
+            row = self._build_quantity_slider_item(send_sheet, UItem)
+            if row is None:
+                row = self._build_quantity_fallback_item(send_sheet, UItem)
+            if row is not None:
+                block.append(row)
+
+        recipients = self._build_recipients_item(send_sheet, UItem)
+        if recipients is not None:
+            block.append(recipients)
+
+        if not block:
+            return []
+
+        if with_quantity:
+            try:
+                AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+                hint = AndroidUtilities.replaceSingleTag(
+                    self._t("send_quantity_hint"),
+                    R(lambda: self._open_send_sheet_quantity_dialog(send_sheet)),
+                )
+                block.append(UItem.asShadow(_SEND_SHEET_QTY_SHADOW_ID, hint))
+            except Exception as e:
+                self.log(f"quantity hint build error: {e}")
+        return block
+
+    def _insert_send_sheet_block(self, send_sheet: Any, items: Any, block: List[Any]):
+        reverse = bool(self._field(send_sheet, "reverseLayout", False))
+
+        anchor = None
+        fallback_anchor = None
+        for index, item in enumerate(self._iter_java_items(items)):
+            item_id = self._to_int(getattr(item, "id", 0))
+            if item_id == -6 and anchor is None:
+                anchor = index
+            elif item_id == 1 and fallback_anchor is None:
+                fallback_anchor = index
+        if anchor is None:
+            anchor = fallback_anchor
+
+        if anchor is None:
+            insert_at = 0 if reverse else int(items.size())
+        else:
+            insert_at = int(anchor) if reverse else int(anchor) + 1
+
+        ordered = list(reversed(block)) if reverse else list(block)
+        for offset, item in enumerate(ordered):
+            try:
+                items.add(int(insert_at + offset), item)
+            except Exception:
+                try:
+                    items.add(item)
+                except Exception as e:
+                    self.log(f"SendGiftSheet block insert error: {e}")
+                    break
+
+    def _build_quantity_slider_item(self, send_sheet: Any, UItem: Any):
+        state = self._send_sheet_state(send_sheet)
+        options = self._quantity_slide_options(send_sheet, state)
+        if options is None:
+            return None
+
+        try:
+            callbacks = state.slide_callbacks
+            if callbacks is None:
+                Callback = jclass("org.telegram.messenger.Utilities$Callback")
+                CallbackReturn = jclass("org.telegram.messenger.Utilities$CallbackReturn")
+                plugin = self
+
+                class _Chosen(dynamic_proxy(Callback)):
+                    def run(self, value):
+                        try:
+                            plugin._on_quantity_slider_changed(send_sheet, value)
+                        except Exception as e:
+                            plugin.log(f"quantity slider callback error: {e}")
+
+                class _ToString(dynamic_proxy(CallbackReturn)):
+                    def run(self, value):
+                        try:
+                            return plugin._t("send_quantity_value", quantity=plugin._format_number(value))
+                        except Exception:
+                            return str(value)
+
+                callbacks = {"chosen": _Chosen(), "to_string": _ToString()}
+                state.slide_callbacks = callbacks
+
+            max_quantity = self._send_sheet_max_quantity(send_sheet)
+            quantity = max(1, min(self._send_sheet_quantity(send_sheet), max_quantity))
+            item = UItem.asIntSlideView(
+                0,
+                1,
+                int(quantity),
+                int(max_quantity),
+                callbacks["to_string"],
+                callbacks["chosen"],
+            )
+            item.object = options
+            item.id = _SEND_SHEET_QTY_ITEM_ID
+            return item
+        except Exception as e:
+            self.log(f"quantity slider item error: {e}")
+            return None
+
+    def _quantity_slide_options(self, send_sheet: Any, state: _SendSheetState):
+        max_quantity = self._send_sheet_max_quantity(send_sheet)
+        cached = state.slide_options
+        if cached is not None and int(state.slide_options_max or 0) == int(max_quantity):
+            return cached
+
+        try:
+            SlideIntChooseView = jclass("org.telegram.ui.Cells.SlideIntChooseView")
+            Callback2Return = jclass("org.telegram.messenger.Utilities$Callback2Return")
+        except Exception:
+            return None
+
+        steps = [value for value in _QTY_STEPS if value <= int(max_quantity)]
+        if not steps:
+            steps = [1]
+        if steps[-1] != int(max_quantity):
+            steps.append(int(max_quantity))
+        if len(steps) < 2:
+            steps = [1, max(2, int(max_quantity))]
+
+        plugin = self
+
+        class _StepToString(dynamic_proxy(Callback2Return)):
+            def run(self, _type, value):
+                try:
+                    return plugin._t("send_quantity_value", quantity=plugin._format_number(value))
+                except Exception:
+                    return str(value)
+
+        try:
+            steps_array = jarray(jint)([int(value) for value in steps])
+            options = SlideIntChooseView.Options.make(0, steps_array, 1, _StepToString())
+        except Exception as e:
+            self.log(f"slide options build error: {e}")
+            return None
+
+        state.slide_options = options
+        state.slide_options_max = int(max_quantity)
+        return options
+
+    def _build_quantity_fallback_item(self, send_sheet: Any, UItem: Any):
+        row = self._get_send_sheet_quantity_row(send_sheet)
+        if row is None:
+            return None
+        self._update_send_sheet_quantity_row(send_sheet, row, False)
+        try:
+            return UItem.asCustom(_SEND_SHEET_QTY_ITEM_ID, row)
+        except Exception as e:
+            self.log(f"quantity fallback item error: {e}")
+            return None
+
+    def _get_send_sheet_quantity_row(self, send_sheet: Any):
+        state = self._send_sheet_state(send_sheet)
+        if state.quantity_row is not None:
+            return state.quantity_row
+
+        row = self._create_text_row(
+            send_sheet,
+            lambda: self._on_send_sheet_quantity_row_click(send_sheet),
+        )
+        if row is not None:
+            state.quantity_row = row
+        return row
+
+    def _update_send_sheet_quantity_row(self, send_sheet: Any, row: Any = None, animated: bool = False):
+        if row is None:
+            row = self._send_sheet_state(send_sheet).quantity_row
+        if row is None:
+            return
+        self._set_row_text_and_value(
+            row,
+            self._t("send_quantity_label"),
+            self._t("send_quantity_value", quantity=self._format_send_sheet_quantity(send_sheet)),
+            animated,
+        )
+
+    def _on_send_sheet_quantity_row_click(self, send_sheet: Any):
+        if self._send_sheet_state(send_sheet).sending:
+            return
+        self._open_send_sheet_quantity_dialog(send_sheet)
+
+    def _build_recipients_item(self, send_sheet: Any, UItem: Any):
+        row = self._get_send_sheet_recipients_row(send_sheet)
+        if row is None:
+            return None
+        self._update_send_sheet_recipients_row(send_sheet, row, False)
+        try:
+            return UItem.asCustom(_SEND_SHEET_RECIPIENTS_ID, row)
+        except Exception as e:
+            self.log(f"recipients item error: {e}")
+            return None
+
+    def _get_send_sheet_recipients_row(self, send_sheet: Any):
+        state = self._send_sheet_state(send_sheet)
+        if state.recipients_row is not None:
+            return state.recipients_row
+
+        row = self._create_text_row(
+            send_sheet,
+            lambda: self._on_recipients_row_click(send_sheet),
+        )
+        if row is not None:
+            state.recipients_row = row
+        return row
+
+    def _update_send_sheet_recipients_row(self, send_sheet: Any, row: Any = None, animated: bool = False):
+        if row is None:
+            row = self._send_sheet_state(send_sheet).recipients_row
+        if row is None:
+            return
+        self._set_row_text_and_value(
+            row,
+            self._t("recipients_label"),
+            self._recipients_label(send_sheet),
+            animated,
+        )
+
+    def _create_text_row(self, send_sheet: Any, on_click):
+        context = self._send_sheet_context(send_sheet)
+        if context is None:
+            return None
+
+        try:
+            TextCell = jclass("org.telegram.ui.Cells.TextCell")
+            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        except Exception:
+            return None
+
+        try:
+            row = TextCell(context, 23, True)
+        except Exception:
+            try:
+                row = TextCell(context)
+            except Exception as e:
+                self.log(f"TextCell create error: {e}")
+                return None
+
+        try:
+            self._set_view_background(row, Theme.getSelectorDrawable(False))
+        except Exception:
+            pass
+        try:
+            row.setOnClickListener(OnClickListener(lambda _v=None: on_click()))
+        except Exception as e:
+            self.log(f"row click bind error: {e}")
+        return row
+
+    def _set_row_text_and_value(self, row: Any, label: str, value: str, animated: bool):
+        try:
+            row.setTextAndValue(str(label), str(value), bool(animated), False)
+            return
+        except Exception:
+            pass
+        try:
+            row.setTextAndValue(str(label), str(value), False)
+        except Exception as e:
+            self.log(f"row update error: {e}")
+
+    def _on_quantity_slider_changed(self, send_sheet: Any, value: Any):
+        state = self._send_sheet_state(send_sheet)
+        if state.sending:
+            return
+        normalized = self._normalize_send_sheet_quantity(send_sheet, value, notify=False)
+        if int(normalized) == int(state.quantity or 0):
+            return
+        state.quantity = int(normalized)
+        self._apply_send_sheet_button_text(send_sheet, True)
+
+    def _open_send_sheet_quantity_dialog(self, send_sheet: Any):
+        if self._send_sheet_state(send_sheet).sending:
+            return
+
+        context = self._send_sheet_context(send_sheet)
+        if context is None:
+            self._notify_error(self._t("no_context"))
+            return
+
+        max_quantity = self._send_sheet_max_quantity(send_sheet)
+        self._show_number_picker(
+            context=context,
+            provider=self._field(send_sheet, "resourcesProvider", None),
+            title=self._t("send_quantity_title"),
+            info=self._t("send_quantity_picker_info", min="1", max=self._format_number(max_quantity)),
+            min_value=1,
+            max_value=int(max_quantity),
+            value=max(1, min(self._send_sheet_quantity(send_sheet), max_quantity)),
+            apply_text=self._t("send_quantity_apply"),
+            on_apply=lambda value: self._set_send_sheet_quantity(send_sheet, int(value), True),
+        )
+
+    def _show_number_picker(
+        self,
+        context: Any,
+        provider: Any,
+        title: str,
+        info: str,
+        min_value: int,
+        max_value: int,
+        value: int,
+        apply_text: str,
+        on_apply,
+    ):
+        try:
+            NumberPicker = jclass("org.telegram.ui.Components.NumberPicker")
+            LinearLayout = jclass("android.widget.LinearLayout")
+            TextView = jclass("android.widget.TextView")
+            ViewGroupLayoutParams = jclass("android.view.ViewGroup$LayoutParams")
+            LayoutParams = jclass("android.widget.LinearLayout$LayoutParams")
+            Gravity = jclass("android.view.Gravity")
+            TypedValue = jclass("android.util.TypedValue")
+        except Exception:
+            self._notify_error(self._t("no_context"))
+            return
+
+        min_value = int(min_value)
+        max_value = max(int(min_value), int(max_value))
+        value = max(min_value, min(int(value), max_value))
+
+        try:
+            container = LinearLayout(context)
+            container.setOrientation(LinearLayout.VERTICAL)
+            container.setPadding(self._dp(20), self._dp(10), self._dp(20), self._dp(4))
+
+            info_view = TextView(context)
+            info_view.setText(str(info))
+            try:
+                info_view.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14)
+            except Exception:
+                info_view.setTextSize(14)
+            try:
+                info_view.setGravity(int(getattr(Gravity, "CENTER_HORIZONTAL", 1)))
+            except Exception:
+                pass
+            self._apply_text_color(info_view, "key_dialogTextBlack", provider)
+            info_lp = LayoutParams(ViewGroupLayoutParams.MATCH_PARENT, ViewGroupLayoutParams.WRAP_CONTENT)
+            info_lp.setMargins(0, 0, 0, self._dp(10))
+            container.addView(info_view, info_lp)
+
+            picker = NumberPicker(context)
+            try:
+                picker.setItemCount(5)
+            except Exception:
+                pass
+            picker.setMinValue(min_value)
+            picker.setMaxValue(max_value)
+            try:
+                picker.setWrapSelectorWheel(max_value > min_value)
+            except Exception:
+                pass
+            picker.setValue(value)
+            container.addView(
+                picker,
+                LayoutParams(
+                    ViewGroupLayoutParams.MATCH_PARENT,
+                    self._dp(int(getattr(NumberPicker, "DEFAULT_SIZE_PER_COUNT", 42) or 42) * 5),
+                ),
+            )
+
+            def apply(builder_obj: AlertDialogBuilder, _which: int):
+                try:
+                    on_apply(int(picker.getValue()))
+                except Exception as e:
+                    self.log(f"number picker apply error: {e}")
+                try:
+                    builder_obj.dismiss()
+                except Exception:
+                    pass
+
+            builder = self._alert_builder(context, provider)
+            builder.set_title(str(title))
+            builder.set_view(container)
+            builder.set_positive_button(str(apply_text), apply)
+            builder.set_negative_button(self._t("cancel_button"), lambda b, _w: b.dismiss())
+            builder.show()
+        except Exception as e:
+            self.log(f"number picker error: {e}")
+
+    def _alert_builder(self, context: Any, provider: Any = None) -> AlertDialogBuilder:
+        if provider is not None:
+            try:
+                return AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_MESSAGE, provider)
+            except Exception:
+                pass
+        return AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+
+    def _send_sheet_state(self, send_sheet: Any) -> _SendSheetState:
+        key = self._send_sheet_key(send_sheet)
+        state = self._send_sheet_states.get(key)
+        if isinstance(state, _SendSheetState):
+            return state
+        state = _SendSheetState()
+        state.quantity = self._initial_quantity()
+        self._send_sheet_states[key] = state
+        return state
+
+    def _initial_quantity(self) -> int:
+        if not self._setting_bool(_SETTING_REMEMBER, True):
+            return 1
+        stored = self._to_int(self.get_setting(_SETTING_LAST_QUANTITY, 1))
+        if stored is None or stored <= 0:
+            return 1
+        return int(stored)
+
+    def _remember_quantity(self, quantity: Any):
+        if not self._setting_bool(_SETTING_REMEMBER, True):
+            return
+        try:
+            self.set_setting(_SETTING_LAST_QUANTITY, int(quantity))
+        except Exception:
+            pass
+
+    def _send_sheet_key(self, obj: Any) -> int:
+        if obj is None:
+            return 0
+        try:
+            System = jclass("java.lang.System")
+            return int(System.identityHashCode(obj))
+        except Exception:
+            pass
+        try:
+            return int(obj.hashCode())
+        except Exception:
+            return int(id(obj))
+
+    def _clear_send_sheet_state(self, send_sheet: Any):
+        key = self._send_sheet_key(send_sheet)
+        state = self._send_sheet_states.get(key)
+        if not isinstance(state, _SendSheetState):
+            return
+        if state.sending:
+            state.detached = True
+            return
+        self._send_sheet_states.pop(key, None)
+
+    def _send_sheet_quantity(self, send_sheet: Any) -> int:
+        state = self._send_sheet_state(send_sheet)
+        try:
+            return max(1, int(state.quantity or 1))
+        except Exception:
+            return 1
+
+    def _set_send_sheet_quantity(self, send_sheet: Any, quantity: Any, animated: bool) -> int:
+        state = self._send_sheet_state(send_sheet)
+        normalized = self._normalize_send_sheet_quantity(send_sheet, quantity, notify=True)
+        state.quantity = normalized
+        self._remember_quantity(normalized)
+        self._update_send_sheet_quantity_row(send_sheet, state.quantity_row, animated)
+        self._update_adapter(send_sheet, animated)
+        self._apply_send_sheet_button_text(send_sheet, animated)
+        return int(normalized)
+
+    def _normalize_send_sheet_quantity(self, send_sheet: Any, quantity: Any, notify: bool) -> int:
+        parsed = self._to_int(quantity)
+        if parsed is None or parsed <= 0:
+            return 1
+
+        limit = self._send_sheet_quantity_limit(send_sheet)
+        if limit not in (None, 0) and parsed > limit:
+            parsed = int(limit)
+            if notify:
+                self._notify_error(self._t("send_quantity_limited", limit=str(limit)))
+
+        ceiling = self._settings_max_quantity()
+        if parsed > ceiling:
+            parsed = int(ceiling)
+        return max(1, int(parsed))
+
+    def _send_sheet_max_quantity(self, send_sheet: Any) -> int:
+        limit = self._send_sheet_quantity_limit(send_sheet)
+        ceiling = self._settings_max_quantity()
+        if limit in (None, 0):
+            return int(ceiling)
+        return max(1, min(int(limit), int(ceiling)))
+
+    def _send_sheet_quantity_limit(self, send_sheet: Any) -> Optional[int]:
+        gift = self._field(send_sheet, "starGift", None)
+        if gift is None:
+            return None
+
+        limits = []
+        try:
+            if bool(getattr(gift, "limited_per_user", False)):
+                remains = self._to_int(getattr(gift, "per_user_remains", 0))
+                if remains is not None and remains > 0:
+                    limits.append(int(remains))
+        except Exception:
+            pass
+        try:
+            if bool(getattr(gift, "limited", False)):
+                remains = self._to_int(getattr(gift, "availability_remains", 0))
+                if remains is not None and remains > 0:
+                    limits.append(int(remains))
+        except Exception:
+            pass
+        if not limits:
+            return None
+        return int(min(limits))
+
+    def _format_send_sheet_quantity(self, send_sheet: Any) -> str:
+        return self._format_number(self._send_sheet_quantity(send_sheet))
+
+    def _send_sheet_recipients(self, send_sheet: Any) -> List[int]:
+        state = self._send_sheet_state(send_sheet)
+        if state.recipients:
+            return list(state.recipients)
+        return [int(self._field(send_sheet, "dialogId", 0) or 0)]
+
+    def _recipients_label(self, send_sheet: Any) -> str:
+        state = self._send_sheet_state(send_sheet)
+        if not state.recipients:
+            return self._t("recipients_current")
+        if len(state.recipients) == 1:
+            title = self._resolve_dialog_title(state.recipients[0])
+            if title:
+                return title
+        return self._t("recipients_count", count=str(len(state.recipients)))
+
+    def _on_recipients_row_click(self, send_sheet: Any):
+        if self._send_sheet_state(send_sheet).sending:
+            return
+        self._open_recipients_picker(send_sheet)
+
+    def _open_recipients_picker(self, send_sheet: Any):
+        DialogsActivityDelegate = find_class("org.telegram.ui.DialogsActivity$DialogsActivityDelegate")
+        if DialogsActivityDelegate is None:
+            self._notify_error(self._t("recipients_picker_unavailable"))
+            return
+
+        fragment = get_last_fragment()
+        if fragment is None:
+            self._notify_error(self._t("no_context"))
+            return
+
+        plugin = self
+
+        class _RecipientsDelegate(dynamic_proxy(DialogsActivityDelegate)):
+            def didSelectDialogs(self, picker_fragment, dids, *_args):
+                try:
+                    plugin._on_recipients_picked(send_sheet, dids)
+                except Exception as e:
+                    plugin.log(f"recipients pick error: {e}")
+
+                plugin._close_picker(picker_fragment, self)
+                return True
+
+            def canSelectStories(self):
+                return False
+
+            def didSelectStories(self, _fragment):
+                return False
+
+        def open_now():
+            try:
+                Bundle = jclass("android.os.Bundle")
+                DialogsActivity = jclass("org.telegram.ui.DialogsActivity")
+
+                args = Bundle()
+                args.putBoolean("onlySelect", True)
+                args.putInt("dialogsType", _DIALOGS_TYPE_FORWARD)
+                args.putBoolean("resetDelegate", False)
+                args.putBoolean("closeFragment", True)
+                args.putBoolean("allowGlobalSearch", True)
+                args.putBoolean("allowUsers", True)
+                args.putBoolean("allowBots", False)
+                args.putBoolean("allowGroups", False)
+                args.putBoolean("allowMegagroups", False)
+                args.putBoolean("allowLegacyGroups", False)
+                args.putBoolean("allowChannels", True)
+
+                picker = DialogsActivity(args)
+                delegate = _RecipientsDelegate()
+                self._picker_delegates.append(delegate)
+                picker.setDelegate(delegate)
+                self._present_picker(fragment, picker)
+            except Exception as e:
+                self.log(f"recipients picker open error: {e}")
+                self._notify_error(self._t("recipients_picker_error"))
+
+        run_on_ui_thread(open_now)
+
+    def _close_picker(self, picker: Any, delegate: Any = None):
+        def _ui():
+            try:
+                picker.finishFragment()
+            except Exception as e:
+                self.log(f"picker finish error: {e}")
+                try:
+                    picker.removeSelfFromStack()
+                except Exception:
+                    pass
+            if delegate is not None:
+                try:
+                    self._picker_delegates.remove(delegate)
+                except ValueError:
+                    pass
+
+        run_on_ui_thread(_ui)
+
+    def _present_picker(self, fragment: Any, picker: Any):
+        try:
+            BottomSheetParams = jclass("org.telegram.ui.ActionBar.BaseFragment$BottomSheetParams")
+            params = BottomSheetParams()
+            try:
+                params.transitionFromLeft = True
+                params.allowNestedScroll = False
+            except Exception:
+                pass
+            if fragment.showAsSheet(picker, params) is not None:
+                return
+        except Exception:
+            pass
+        fragment.presentFragment(picker)
+
+    def _on_recipients_picked(self, send_sheet: Any, dids: Any):
+        recipients: List[int] = []
+        for entry in self._iter_java_items(dids):
+            dialog_id = self._to_int(getattr(entry, "dialogId", None))
+            if dialog_id is None:
+                dialog_id = self._to_int(entry)
+            if dialog_id in (None, 0):
+                continue
+            if int(dialog_id) not in recipients:
+                recipients.append(int(dialog_id))
+
+        state = self._send_sheet_state(send_sheet)
+        state.recipients = recipients
+
+        def _ui():
+            self._update_send_sheet_recipients_row(send_sheet, state.recipients_row, True)
+            self._apply_send_sheet_button_text(send_sheet, True)
+
+        run_on_ui_thread(_ui)
+
+    def _resolve_dialog_title(self, dialog_id: int) -> str:
+        did = int(dialog_id or 0)
+        if did == 0:
+            return ""
+        mc = get_messages_controller()
+        if mc is None:
+            return ""
+        try:
+            if did > 0 and hasattr(mc, "getUser"):
+                user = mc.getUser(int(did))
+                if user is not None:
+                    first = str(getattr(user, "first_name", "") or "").strip()
+                    last = str(getattr(user, "last_name", "") or "").strip()
+                    username = str(getattr(user, "username", "") or "").strip()
+                    title = " ".join([x for x in (first, last) if x]).strip()
+                    if title:
+                        return title
+                    if username:
+                        return f"@{username}"
+            if did < 0 and hasattr(mc, "getChat"):
+                chat = mc.getChat(int(-did))
+                if chat is None and did <= -1000000000000:
+                    channel_chat_id = int(abs(did) - 1000000000000)
+                    if channel_chat_id > 0:
+                        chat = mc.getChat(channel_chat_id)
+                if chat is not None:
+                    return str(getattr(chat, "title", "") or "").strip()
+        except Exception:
+            return ""
+        return ""
+
+    def _can_bulk_send_gifts(self, send_sheet: Any) -> bool:
+        gift = self._field(send_sheet, "starGift", None)
+        if gift is None:
+            return False
+        if self._gift_id(gift) == _CONFIG_GIFT_ID:
+            return False
+        if self._field(send_sheet, "premiumTier", None) is not None:
+            return False
+        if self._field(send_sheet, "auction", None) is not None:
+            return False
+        try:
+            if bool(getattr(gift, "auction", False)):
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _send_sheet_message(self, send_sheet: Any):
+        paid_messages_stars = self._to_int(self._field(send_sheet, "send_paid_messages_stars", 0))
+        if paid_messages_stars is not None and paid_messages_stars > 0:
+            return None
+        action = self._field(send_sheet, "action", None)
+        if action is None:
+            return None
+        return getattr(action, "message", None)
+
+    def _send_sheet_unit_price(self, send_sheet: Any) -> int:
+        gift = self._field(send_sheet, "starGift", None)
+        if gift is None:
+            return 0
+
+        total = self._to_int(getattr(gift, "stars", 0)) or 0
+        if bool(self._field(send_sheet, "upgrade", False)):
+            total += self._to_int(getattr(gift, "upgrade_stars", 0)) or 0
+
+        paid_messages_stars = self._to_int(self._field(send_sheet, "send_paid_messages_stars", 0)) or 0
+        if paid_messages_stars > 0:
+            message_edit = self._field(send_sheet, "messageEdit", None)
+            try:
+                message_text = str(message_edit.getText() or "")
+            except Exception:
+                message = self._send_sheet_message(send_sheet)
+                message_text = str(getattr(message, "text", "") or "")
+            if message_text != "":
+                total += paid_messages_stars
+        return max(0, int(total))
+
+    def _send_sheet_total_units(self, send_sheet: Any) -> int:
+        state = self._send_sheet_state(send_sheet)
+        if state.sending:
+            return max(1, int(state.requested or 1))
+        recipients = max(1, len(self._send_sheet_recipients(send_sheet)))
+        return max(1, int(self._send_sheet_quantity(send_sheet)) * recipients)
+
+    def _stars_controller_for_account(self, account: int):
+        try:
+            StarsController = jclass("org.telegram.ui.Stars.StarsController")
+            return StarsController.getInstance(int(account))
+        except Exception:
+            return None
+
+    def _make_callback2(self, callback):
+        try:
+            Callback2 = jclass("org.telegram.messenger.Utilities$Callback2")
+        except Exception:
+            return callback
+
+        plugin = self
+
+        class _Callback(dynamic_proxy(Callback2)):
+            def run(self, arg, arg2):
+                try:
+                    callback(arg, arg2)
+                except Exception as e:
+                    plugin.log(f"callback2 proxy error: {e}")
+
+        return _Callback()
+
+    def _apply_send_sheet_button_text(self, send_sheet: Any, animated: bool):
+        if send_sheet is None or not self._can_bulk_send_gifts(send_sheet):
+            return
+
+        button = self._field(send_sheet, "button", None)
+        if button is None:
+            return
+
+        state = self._send_sheet_state(send_sheet)
+        total_units = self._send_sheet_total_units(send_sheet)
+        total_price = max(0, int(self._send_sheet_unit_price(send_sheet)) * int(total_units))
+
+        balance_available, balance = self._stars_balance(send_sheet)
+
+        try:
+            LocaleController = jclass("org.telegram.messenger.LocaleController")
+            StarsIntroActivity = jclass("org.telegram.ui.Stars.StarsIntroActivity")
+            total_price_display = min(int(total_price), _JAVA_INT_MAX)
+            text_key = "Gift2SendSelf" if bool(self._field(send_sheet, "self", False)) else "Gift2Send"
+            label = LocaleController.formatPluralStringComma(text_key, int(total_price_display))
+            cached_star_span = self._field(send_sheet, "cachedStarSpan", None)
+            try:
+                label = StarsIntroActivity.replaceStars(label, cached_star_span)
+            except Exception:
+                label = str(label)
+            button.setText(self._prefix_quantity(label, total_units), bool(animated))
+
+            if state.sending:
+                button.setSubText(
+                    self._t(
+                        "send_quantity_progress",
+                        current=str(min(int(state.sent or 0), int(state.requested or 1))),
+                        total=str(int(state.requested or 1)),
+                    ),
+                    bool(animated),
+                )
+            elif balance_available and total_price > balance:
+                balance_display = min(int(balance), _JAVA_INT_MAX)
+                button.setSubText(
+                    LocaleController.formatPluralStringComma("Gift2SendYourBalance", int(balance_display)),
+                    bool(animated),
+                )
+            else:
+                button.setSubText(None, bool(animated))
+        except Exception as e:
+            self.log(f"apply SendGiftSheet button text error: {e}")
+
+    def _prefix_quantity(self, label: Any, total_units: int):
+        if int(total_units) <= 1:
+            return label
+        prefix = self._t("send_quantity_value", quantity=self._format_number(total_units)) + " · "
+        try:
+            SpannableStringBuilder = jclass("android.text.SpannableStringBuilder")
+            builder = SpannableStringBuilder()
+            builder.append(prefix)
+            builder.append(label)
+            return builder
+        except Exception:
+            return prefix + str(label)
+
+    def _set_button_loading(self, send_sheet: Any, loading: bool):
+        button = self._field(send_sheet, "button", None)
+        if button is None:
+            return
+        try:
+            button.setLoading(bool(loading))
+        except Exception:
+            pass
+
+    def _stars_balance(self, send_sheet: Any):
+        controller = self._stars_controller_for_account(self._send_sheet_account(send_sheet))
+        if controller is None:
+            return False, 0
+        available = False
+        balance = 0
+        try:
+            available = bool(controller.balanceAvailable())
+        except Exception:
+            available = False
+        try:
+            balance = int(getattr(controller.getBalance(), "amount", 0) or 0)
+        except Exception:
+            balance = 0
+        return available, balance
+
+    def _intercept_send_sheet_bulk_buy(self, send_sheet: Any) -> bool:
+        if send_sheet is None or not self._can_bulk_send_gifts(send_sheet):
+            return False
+
+        state = self._send_sheet_state(send_sheet)
+        if state.sending:
+
+            self._set_button_loading(send_sheet, False)
+            state.cancelled = True
+            self._apply_send_sheet_button_text(send_sheet, True)
+            return True
+
+        selected_quantity = self._send_sheet_quantity(send_sheet)
+        normalized_quantity = self._normalize_send_sheet_quantity(send_sheet, selected_quantity, notify=True)
+        if normalized_quantity != selected_quantity:
+            self._set_send_sheet_quantity(send_sheet, normalized_quantity, True)
+
+        recipients = [did for did in self._send_sheet_recipients(send_sheet) if int(did or 0) != 0]
+        if not recipients:
+            return False
+        if int(normalized_quantity) <= 1 and len(recipients) == 1:
+            if int(recipients[0]) == int(self._field(send_sheet, "dialogId", 0) or 0):
+                return False
+
+        gift = self._field(send_sheet, "starGift", None)
+        if gift is None:
+            return False
+
+        plan: List[int] = []
+        for dialog_id in recipients:
+            plan.extend([int(dialog_id)] * int(normalized_quantity))
+        if not plan:
+            return False
+
+        unit_price = self._send_sheet_unit_price(send_sheet)
+        total_price = int(unit_price) * len(plan)
+        balance_available, balance = self._stars_balance(send_sheet)
+        if balance_available and total_price > balance:
+            self._offer_stars_topup(send_sheet, total_price, balance)
+            return True
+
+        state.sending = True
+        state.cancelled = False
+        state.sent = 0
+        state.spent = 0
+        state.requested = len(plan)
+        self._remember_quantity(normalized_quantity)
+
+        self._set_button_loading(send_sheet, False)
+        self._apply_send_sheet_button_text(send_sheet, True)
+
+        self._send_sheet_bulk_step(
+            send_sheet,
+            gift,
+            bool(self._field(send_sheet, "anonymous", False)),
+            bool(self._field(send_sheet, "upgrade", False)),
+            self._send_sheet_message(send_sheet),
+            plan,
+            int(self._send_sheet_account(send_sheet)),
+            int(unit_price),
+            0,
+            0,
+        )
+        return True
+
+    def _offer_stars_topup(self, send_sheet: Any, need: int, balance: int):
+        self._set_button_loading(send_sheet, False)
+        self._notify_error(self._t("balance_low_text", need=self._format_number(need), balance=self._format_number(balance)))
+
+        context = self._send_sheet_context(send_sheet)
+        if context is None:
+            return
+
+        def _ui():
+            try:
+                StarsOptionsSheet = jclass("org.telegram.ui.Stars.StarsIntroActivity$StarsOptionsSheet")
+                provider = self._field(send_sheet, "resourcesProvider", None)
+                StarsOptionsSheet(context, provider).show()
+            except Exception as e:
+                self.log(f"stars topup sheet error: {e}")
+
+        run_on_ui_thread(_ui)
+
+    def _send_sheet_bulk_step(
+        self,
+        send_sheet: Any,
+        gift: Any,
+        anonymous: bool,
+        upgrade: bool,
+        message: Any,
+        plan: List[int],
+        current_account: int,
+        unit_price: int,
+        index: int,
+        flood_retries: int,
+    ):
+        state = self._send_sheet_state(send_sheet)
+        if state.cancelled or int(index) >= len(plan):
+            self._finish_send_sheet_bulk(send_sheet, gift, current_account, int(index), len(plan), not state.cancelled, None)
+            return
+
+        controller = self._stars_controller_for_account(current_account)
+        if controller is None:
+            self._finish_send_sheet_bulk(send_sheet, gift, current_account, int(index), len(plan), False, "StarsController missing")
+            return
+
+        def _on_done(status: bool, err: Any):
+            if status:
+                next_index = int(index) + 1
+                state.sent = next_index
+                state.spent = int(unit_price) * next_index
+                self._haptic(send_sheet)
+                if next_index >= len(plan):
+                    self._finish_send_sheet_bulk(send_sheet, gift, current_account, next_index, len(plan), True, None)
+                    return
+                self._apply_send_sheet_button_text(send_sheet, True)
+                self._schedule_next_step(
+                    send_sheet, gift, anonymous, upgrade, message, plan,
+                    current_account, unit_price, next_index, 0, self._settings_delay_ms(),
+                )
+                return
+
+            flood_seconds = self._parse_flood_wait(err)
+            if flood_seconds is not None and int(flood_retries) < _FLOOD_RETRIES:
+                self._notify_error(self._t("flood_wait", seconds=str(flood_seconds)))
+                self._schedule_next_step(
+                    send_sheet, gift, anonymous, upgrade, message, plan,
+                    current_account, unit_price, int(index), int(flood_retries) + 1,
+                    int(flood_seconds) * 1000 + 500,
+                )
+                return
+
+            self._finish_send_sheet_bulk(send_sheet, gift, current_account, int(index), len(plan), False, err)
+
+        try:
+            controller.buyStarGift(
+                gift,
+                bool(anonymous),
+                bool(upgrade),
+                int(plan[int(index)]),
+                message,
+                self._make_callback2(_on_done),
+            )
+        except Exception as e:
+            self._finish_send_sheet_bulk(send_sheet, gift, current_account, int(index), len(plan), False, str(e))
+
+    def _schedule_next_step(
+        self,
+        send_sheet: Any,
+        gift: Any,
+        anonymous: bool,
+        upgrade: bool,
+        message: Any,
+        plan: List[int],
+        current_account: int,
+        unit_price: int,
+        index: int,
+        flood_retries: int,
+        delay_ms: int,
+    ):
+        def _run():
+            self._send_sheet_bulk_step(
+                send_sheet, gift, anonymous, upgrade, message, plan,
+                current_account, unit_price, index, flood_retries,
+            )
+
+        if int(delay_ms) <= 0:
+            run_on_ui_thread(_run)
+            return
+
+        try:
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+            AndroidUtilities.runOnUIThread(R(_run), int(delay_ms))
+        except Exception as e:
+            self.log(f"schedule step error: {e}")
+            run_on_ui_thread(_run)
+
+    def _parse_flood_wait(self, err: Any) -> Optional[int]:
+        text = str(err or "")
+        match = re.search(r"FLOOD_WAIT_(\d+)", text)
+        if match is None:
+            return None
+        seconds = self._to_int(match.group(1))
+        if seconds is None or seconds <= 0:
+            return None
+        return min(int(seconds), 60)
+
+    def _finish_send_sheet_bulk(
+        self,
+        send_sheet: Any,
+        gift: Any,
+        current_account: int,
+        completed: int,
+        total_quantity: int,
+        success: bool,
+        err: Any,
+    ):
+        key = self._send_sheet_key(send_sheet)
+        state = self._send_sheet_states.get(key)
+        if not isinstance(state, _SendSheetState):
+            state = self._send_sheet_state(send_sheet)
+
+        cancelled = bool(state.cancelled)
+        state.sending = False
+        state.cancelled = False
+        state.sent = int(completed)
+        state.requested = int(total_quantity)
+
+        self._set_button_loading(send_sheet, False)
+
+        err_code = str(err or "")
+
+        if success and not cancelled:
+            self._notify_done(int(completed), int(state.spent or 0))
+            close_parent_sheet = self._field(send_sheet, "closeParentSheet", None)
+            try:
+                if close_parent_sheet is not None:
+                    close_parent_sheet.run()
+            except Exception:
+                pass
+            self._hide_send_sheet_keyboard(send_sheet)
+            self._dismiss_send_sheet(send_sheet)
+            self._send_sheet_states.pop(key, None)
+            return
+
+        if cancelled:
+            self._notify_success(self._t("send_stopped", done=str(completed), total=str(total_quantity)))
+        elif int(completed) > 0:
+            self._notify_success(self._t("send_quantity_partial", done=str(completed), total=str(total_quantity)))
+
+        if err_code == "STARGIFT_USAGE_LIMITED":
+            controller = self._stars_controller_for_account(current_account)
+            if controller is not None and gift is not None:
+                try:
+                    controller.makeStarGiftSoldOut(gift)
+                except Exception:
+                    pass
+            self._hide_send_sheet_keyboard(send_sheet)
+            self._dismiss_send_sheet(send_sheet)
+            self._send_sheet_states.pop(key, None)
+            return
+
+        if err_code == "STARGIFT_USER_USAGE_LIMITED":
+            self._notify_error(self._t("error_usage_limited", code=err_code))
+            self._hide_send_sheet_keyboard(send_sheet)
+            self._dismiss_send_sheet(send_sheet)
+            self._send_sheet_states.pop(key, None)
+            return
+
+        if int(completed) > 0 and int(completed) < int(total_quantity):
+            state.quantity = max(1, int(total_quantity) - int(completed))
+            self._update_send_sheet_quantity_row(send_sheet, state.quantity_row, True)
+            self._update_adapter(send_sheet, True)
+
+        if err_code != "":
+            self._notify_error(self._t("error_with_code", code=err_code))
+        if state.detached:
+            self._send_sheet_states.pop(key, None)
+            return
+        self._apply_send_sheet_button_text(send_sheet, True)
+
+    def _notify_done(self, gifts: int, stars: int):
+        title = self._t("send_done_title", gifts=self._plural_gifts(int(gifts)))
+        subtitle = self._t("send_done_subtitle", stars=self._format_number(stars))
+        try:
+            icon = int(getattr(getattr(R_tg, "raw", None), "gift", 0) or 0)
+        except Exception:
+            icon = 0
+        if icon:
+            try:
+                BulletinHelper.show_two_line(title, subtitle, icon)
+                return
+            except Exception as e:
+                self.log(f"two line bulletin error: {e}")
+        self._notify_success(f"{title} · {subtitle}")
+
+    def _plural_gifts(self, count: int) -> str:
+        count = int(count)
+        tail = count % 100
+        if 11 <= tail <= 14:
+            word = "подарков"
+        else:
+            last = count % 10
+            if last == 1:
+                word = "подарок"
+            elif 2 <= last <= 4:
+                word = "подарка"
+            else:
+                word = "подарков"
+        return f"{self._format_number(count)} {word}"
+
+    def _haptic(self, send_sheet: Any):
+        if not self._setting_bool(_SETTING_HAPTIC, True):
+            return
+        view = self._field(send_sheet, "button", None)
+        if view is None:
+            return
+        try:
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+            AndroidUtilities.vibrateCursor(view)
+        except Exception:
+            pass
+
+    def _update_adapter(self, send_sheet: Any, animated: bool):
+        adapter = self._field(send_sheet, "adapter", None)
+        if adapter is None:
+            return
+        try:
+            adapter.update(bool(animated))
+        except Exception:
+            pass
+
+    def _send_sheet_context(self, send_sheet: Any):
+        context = None
+        try:
+            context = send_sheet.getContext()
+        except Exception:
+            context = None
+        if context is not None:
+            return context
+        activity, _ = self._get_ui_context()
+        return activity
+
+    def _send_sheet_account(self, send_sheet: Any) -> int:
+        account = self._to_int(self._field(send_sheet, "currentAccount", self._current_account()))
+        if account is None:
+            return self._current_account()
+        return int(account)
+
+    def _hide_send_sheet_keyboard(self, send_sheet: Any):
+        try:
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+            message_edit = self._field(send_sheet, "messageEdit", None)
+            if message_edit is not None:
+                AndroidUtilities.hideKeyboard(message_edit)
+        except Exception:
+            pass
+
+    def _dismiss_send_sheet(self, send_sheet: Any):
+        try:
+            send_sheet.dismiss()
+        except Exception:
+            pass
+
+    def _maybe_open_config(self, send_sheet: Any) -> bool:
+        if send_sheet is None:
+            return False
+        if self._gift_id(self._field(send_sheet, "starGift", None)) != _CONFIG_GIFT_ID:
+            return False
+
+        context = self._send_sheet_context(send_sheet)
+        if context is None:
+            self._notify_error(self._t("no_context"))
+            return True
+
+        provider = self._field(send_sheet, "resourcesProvider", None)
+        run_on_ui_thread(lambda: self._open_config_sheet(context, provider))
+        return True
+
+    def _tune_config_cell(self, cell: Any):
+        price_view = self._field(cell, "priceView", None)
+        if price_view is not None:
+            try:
+                price_view.setText(self._t("cfg_chip"))
+            except Exception:
+                pass
+
+        ribbon = self._field(cell, "ribbon", None)
+        if ribbon is not None:
+            try:
+                ribbon.setVisibility(8)
+            except Exception:
+                pass
+
+    def _bind_sheet_long_press(self, sheet: Any):
+        recycler = self._field(sheet, "recyclerListView", None)
+        if recycler is None:
+            return
+
+        try:
+            listener_iface = jclass("org.telegram.ui.Components.RecyclerListView$OnItemLongClickListener")
+        except Exception:
+            return
+
+        plugin = self
+
+        class _Listener(dynamic_proxy(listener_iface)):
+            def onItemClick(self, view: Any, position: Any) -> bool:
+                try:
+                    return bool(plugin._on_sheet_long_press(sheet, int(position)))
+                except Exception as e:
+                    plugin.log(f"long press handler error: {e}")
+                    return False
+
+        try:
+            recycler.setOnItemLongClickListener(_Listener())
+        except Exception as e:
+            self.log(f"bind long press error: {e}")
+
+    def _on_sheet_long_press(self, sheet: Any, position: int) -> bool:
+        adapter = self._field(sheet, "adapter", None)
+        if adapter is None:
+            return False
+
+        gift_id = 0
+        for offset in (-1, 0):
+            try:
+                item = adapter.getItem(int(position) + offset)
+            except Exception:
+                item = None
+            candidate = self._gift_id(getattr(item, "object", None)) if item is not None else 0
+            if candidate > 0 and self._find_custom_spec(candidate) is not None:
+                gift_id = int(candidate)
+                break
+
+        if gift_id <= 0:
+            return False
+
+        context = None
+        try:
+            context = sheet.getContext()
+        except Exception:
+            context = None
+        if context is None:
+            return False
+
+        provider = self._field(sheet, "resourcesProvider", None)
+        run_on_ui_thread(lambda: self._open_gift_editor(context, provider, gift_id))
+        return True
+
+    def _open_config_sheet(self, context: Any, provider: Any):
+        try:
+            BottomSheet = jclass("org.telegram.ui.ActionBar.BottomSheet")
+            LinearLayout = jclass("android.widget.LinearLayout")
+            LayoutParams = jclass("android.widget.LinearLayout$LayoutParams")
+            TextView = jclass("android.widget.TextView")
+            UniversalRecyclerView = jclass("org.telegram.ui.Components.UniversalRecyclerView")
+            Callback2 = jclass("org.telegram.messenger.Utilities$Callback2")
+            Callback5 = jclass("org.telegram.messenger.Utilities$Callback5")
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+        except Exception as e:
+            self.log(f"config sheet classes missing: {e}")
+            self._notify_error(self._t("cfg_open_error"))
+            return
+
+        self._dismiss_config_sheet()
+        plugin = self
+
+        class _Fill(dynamic_proxy(Callback2)):
+            def run(self, items, adapter):
+                try:
+                    plugin._fill_config_items(items)
+                except Exception as e:
+                    plugin.log(f"fill config items error: {e}")
+
+        class _Click(dynamic_proxy(Callback5)):
+            def run(self, item, view, position, x, y):
+                try:
+                    plugin._on_config_click(item, view)
+                except Exception as e:
+                    plugin.log(f"config click error: {e}")
+
+        try:
+            try:
+                sheet = BottomSheet(context, False, provider)
+            except Exception:
+                sheet = BottomSheet(context, False)
+
+            background = self._theme_color("key_dialogBackground", provider)
+
+            root = LinearLayout(context)
+            root.setOrientation(LinearLayout.VERTICAL)
+            self._call_int_color(root, "setBackgroundColor", background)
+
+            title = TextView(context)
+            title.setText(self._t("cfg_title"))
+            title.setTextSize(20)
+            try:
+                title.setTypeface(AndroidUtilities.bold())
+            except Exception:
+                pass
+            title.setPadding(self._dp(22), self._dp(16), self._dp(22), self._dp(8))
+            self._call_int_color(title, "setTextColor", self._theme_color("key_dialogTextBlack", provider))
+            root.addView(title, LayoutParams(-1, -2))
+
+            fill_callback = _Fill()
+            click_callback = _Click()
+            self._config_refs = [fill_callback, click_callback]
+
+            recycler = UniversalRecyclerView(
+                context,
+                int(self._current_account()),
+                0,
+                fill_callback,
+                click_callback,
+                None,
+                provider,
+            )
+            self._call_int_color(recycler, "setBackgroundColor", background)
+            root.addView(recycler, LayoutParams(-1, self._dp(self._config_height_dp())))
+
+            sheet.setCustomView(root)
+            try:
+                sheet.fixNavigationBar(self._as_java_color(background))
+            except Exception:
+                try:
+                    self._call_int_color(sheet, "fixNavigationBar", background)
+                except Exception:
+                    pass
+
+            self._config_sheet = sheet
+            self._config_recycler = recycler
+            self._config_provider = provider
+
+            try:
+                DismissListener = jclass("android.content.DialogInterface$OnDismissListener")
+
+                class _Dismiss(dynamic_proxy(DismissListener)):
+                    def onDismiss(self, dialog):
+                        try:
+                            plugin._on_config_dismissed(sheet)
+                        except Exception:
+                            pass
+
+                dismiss_listener = _Dismiss()
+                self._config_refs.append(dismiss_listener)
+                sheet.setOnDismissListener(dismiss_listener)
+            except Exception:
+                pass
+
+            sheet.show()
+        except Exception as e:
+            self.log(f"config sheet error: {e}")
+            self._notify_error(self._t("cfg_open_error"))
+
+    def _on_config_dismissed(self, sheet: Any):
+        if self._config_sheet is not sheet:
+            return
+        self._config_sheet = None
+        self._config_recycler = None
+        self._config_provider = None
+        self._config_refs = []
+        self._config_gift_ids = []
+
+    def _dismiss_config_sheet(self):
+        sheet = self._config_sheet
+        self._config_sheet = None
+        self._config_recycler = None
+        self._config_provider = None
+        self._config_refs = []
+        self._config_gift_ids = []
+        if sheet is None:
+            return
+        try:
+            sheet.dismiss()
+        except Exception:
+            pass
+
+    def _update_config_sheet(self):
+        recycler = self._config_recycler
+        if recycler is None:
+            return
+
+        def _ui():
+            try:
+                adapter = getattr(recycler, "adapter", None)
+                if adapter is not None:
+                    adapter.update(True)
+            except Exception:
+                pass
+
+        run_on_ui_thread(_ui)
+
+    def _config_height_dp(self) -> int:
+        rows = len(self._custom_gift_specs())
+        total = 40 + rows * 50 + 50 + 46 + 40 + 3 * 50 + 2 * (40 + 60) + 56
+        try:
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+            density = max(1, self._dp(1))
+            limit = int(int(AndroidUtilities.displaySize.y) * 0.72 / density)
+        except Exception:
+            limit = 520
+        return max(260, min(int(total), int(limit)))
+
+    def _fill_config_items(self, items: Any):
+        try:
+            UItem = jclass("org.telegram.ui.Components.UItem")
+        except Exception:
+            return
+
+        specs = self._custom_gift_specs()
+        self._config_gift_ids = [int(spec["id"]) for spec in specs]
+
+        items.add(UItem.asHeader(_CFG_GIFTS_HEADER_ID, self._t("cfg_gifts_header")))
+        for index, spec in enumerate(specs):
+            value = self._t(
+                "cfg_gift_value",
+                stars=self._format_number(spec.get("stars", _CUSTOM_GIFT_DEFAULT_STARS)),
+                pack=self._custom_pack_name(spec.get("pack", _CUSTOM_GIFT_PACK)),
+                index=str(self._normalize_custom_sticker_index(spec.get("sticker_number"))),
+            )
+            items.add(UItem.asButton(_CFG_GIFT_BASE_ID + int(index), str(int(spec["id"])), value))
+
+        add_icon = self._icon("msg_add")
+        if add_icon:
+            add_item = UItem.asButton(_CFG_GIFT_ADD_ID, int(add_icon), self._t("cfg_gift_add"))
+        else:
+            add_item = UItem.asButton(_CFG_GIFT_ADD_ID, self._t("cfg_gift_add"))
+        try:
+            add_item.accent = True
+        except Exception:
+            pass
+        items.add(add_item)
+        items.add(
+            UItem.asShadow(
+                _CFG_GIFTS_SHADOW_ID,
+                self._t("cfg_gifts_hint") if specs else self._t("cfg_gifts_empty"),
+            )
+        )
+
+        items.add(UItem.asHeader(_CFG_SEND_HEADER_ID, self._t("cfg_send_header")))
+        items.add(UItem.asCheck(_CFG_RIBBON_ID, self._t("cfg_ribbon")).setChecked(self._setting_bool(_SETTING_RIBBON, True)))
+        items.add(UItem.asCheck(_CFG_REMEMBER_ID, self._t("cfg_remember")).setChecked(self._setting_bool(_SETTING_REMEMBER, True)))
+        items.add(UItem.asCheck(_CFG_HAPTIC_ID, self._t("cfg_haptic")).setChecked(self._setting_bool(_SETTING_HAPTIC, True)))
+
+        delay_item = self._config_slide_item(
+            UItem,
+            _CFG_DELAY_ID,
+            "delay",
+            _CFG_DELAY_STEPS,
+            self._settings_delay_ms(),
+            self._format_delay_value,
+            self._on_delay_chosen,
+        )
+        if delay_item is not None:
+            items.add(UItem.asHeader(_CFG_DELAY_HEADER_ID, self._t("cfg_delay")))
+            items.add(delay_item)
+
+        quantity_item = self._config_slide_item(
+            UItem,
+            _CFG_MAX_QUANTITY_ID,
+            "max_quantity",
+            _CFG_MAX_QUANTITY_STEPS,
+            self._settings_max_quantity(),
+            self._format_max_quantity_value,
+            self._on_max_quantity_chosen,
+        )
+        if quantity_item is not None:
+            items.add(UItem.asHeader(_CFG_MAX_QUANTITY_HEADER_ID, self._t("cfg_max_quantity")))
+            items.add(quantity_item)
+
+        items.add(UItem.asShadow(_CFG_SEND_SHADOW_ID, self._t("cfg_send_hint")))
+
+    def _config_slide_item(self, UItem: Any, item_id: int, cache_key: str, steps, value: int, formatter, on_choose):
+        cached = self._config_slides.get(cache_key)
+        if cached is None:
+            try:
+                SlideIntChooseView = jclass("org.telegram.ui.Cells.SlideIntChooseView")
+                Callback = jclass("org.telegram.messenger.Utilities$Callback")
+                CallbackReturn = jclass("org.telegram.messenger.Utilities$CallbackReturn")
+                Callback2Return = jclass("org.telegram.messenger.Utilities$Callback2Return")
+            except Exception:
+                return None
+
+            plugin = self
+
+            class _StepToString(dynamic_proxy(Callback2Return)):
+                def run(self, _type, val):
+                    try:
+                        return formatter(val)
+                    except Exception:
+                        return str(val)
+
+            class _ToString(dynamic_proxy(CallbackReturn)):
+                def run(self, val):
+                    try:
+                        return formatter(val)
+                    except Exception:
+                        return str(val)
+
+            class _Chosen(dynamic_proxy(Callback)):
+                def run(self, val):
+                    try:
+                        on_choose(val)
+                    except Exception as e:
+                        plugin.log(f"slide callback error: {e}")
+
+            try:
+                step_to_string = _StepToString()
+                steps_array = jarray(jint)([int(step) for step in steps])
+                options = SlideIntChooseView.Options.make(0, steps_array, 1, step_to_string)
+            except Exception as e:
+                self.log(f"slide options build error: {e}")
+                return None
+
+            cached = {
+                "options": options,
+                "step_to_string": step_to_string,
+                "to_string": _ToString(),
+                "chosen": _Chosen(),
+            }
+            self._config_slides[cache_key] = cached
+
+        try:
+            item = UItem.asIntSlideView(
+                0,
+                int(steps[0]),
+                int(value),
+                int(steps[-1]),
+                cached["to_string"],
+                cached["chosen"],
+            )
+            item.object = cached["options"]
+            item.id = int(item_id)
+            return item
+        except Exception as e:
+            self.log(f"slide item error: {e}")
+            return None
+
+    def _format_delay_value(self, value: Any) -> str:
+        parsed = self._to_int(value) or 0
+        if parsed <= 0:
+            return self._t("cfg_delay_off")
+        return self._t("cfg_delay_value", value=self._format_number(parsed))
+
+    def _format_max_quantity_value(self, value: Any) -> str:
+        return self._t("send_quantity_value", quantity=self._format_number(value))
+
+    def _on_delay_chosen(self, value: Any):
+        parsed = self._to_int(value)
+        if parsed is None:
+            return
+        try:
+            self.set_setting(_SETTING_DELAY, str(max(0, int(parsed))))
+        except Exception as e:
+            self.log(f"save delay error: {e}")
+
+    def _on_max_quantity_chosen(self, value: Any):
+        parsed = self._to_int(value)
+        if parsed is None or parsed <= 0:
+            return
+        try:
+            self.set_setting(_SETTING_MAX_QUANTITY, str(min(int(parsed), _MAX_QUANTITY_CEILING)))
+        except Exception as e:
+            self.log(f"save max quantity error: {e}")
+
+    def _on_config_click(self, item: Any, view: Any):
+        item_id = self._to_int(getattr(item, "id", None))
+        if item_id is None:
+            return
+
+        if item_id == _CFG_GIFT_ADD_ID:
+            self._open_gift_editor(self._config_context(), self._config_provider, None)
+            return
+
+        if item_id >= _CFG_GIFT_BASE_ID:
+            index = int(item_id) - _CFG_GIFT_BASE_ID
+            if 0 <= index < len(self._config_gift_ids):
+                self._open_gift_editor(self._config_context(), self._config_provider, self._config_gift_ids[index])
+            return
+
+        toggles = {
+            _CFG_RIBBON_ID: _SETTING_RIBBON,
+            _CFG_REMEMBER_ID: _SETTING_REMEMBER,
+            _CFG_HAPTIC_ID: _SETTING_HAPTIC,
+        }
+        key = toggles.get(int(item_id))
+        if key is None:
+            return
+
+        new_value = not self._setting_bool(key, True)
+        try:
+            self.set_setting(key, bool(new_value))
+        except Exception as e:
+            self.log(f"save toggle error: {e}")
+            return
+
+        try:
+            item.checked = bool(new_value)
+        except Exception:
+            pass
+        try:
+            view.setChecked(bool(new_value))
+        except Exception:
+            pass
+        if key == _SETTING_RIBBON:
+            self._refresh_gift_sheet()
+
+    def _config_context(self):
+        recycler = self._config_recycler
+        if recycler is not None:
+            try:
+                return recycler.getContext()
+            except Exception:
+                pass
+        activity, _ = self._get_ui_context()
+        return activity
+
+    def _open_gift_editor(self, context: Any, provider: Any, gift_id: Optional[int]):
+        if context is None:
+            self._notify_error(self._t("no_context"))
+            return
+
+        try:
+            BottomSheet = jclass("org.telegram.ui.ActionBar.BottomSheet")
+            LinearLayout = jclass("android.widget.LinearLayout")
+            LayoutParams = jclass("android.widget.LinearLayout$LayoutParams")
+            TextView = jclass("android.widget.TextView")
+            EditTextCell = jclass("org.telegram.ui.Cells.EditTextCell")
+            TextCell = jclass("org.telegram.ui.Cells.TextCell")
+            ButtonWithCounterView = jclass("org.telegram.ui.Stories.recorder.ButtonWithCounterView")
+            InputType = jclass("android.text.InputType")
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+        except Exception as e:
+            self.log(f"gift editor classes missing: {e}")
+            self._notify_error(self._t("cfg_open_error"))
+            return
+
+        self._dismiss_editor_sheet()
+        spec = self._find_custom_spec(gift_id) if gift_id else None
+        state: Dict[str, Any] = {
+            "gift_id": int(spec["id"]) if spec else None,
+            "pack": self._custom_pack_name(spec.get("pack") if spec else ""),
+            "index": self._normalize_custom_sticker_index(spec.get("sticker_number") if spec else None),
+        }
+
+        plugin = self
+
+        try:
+            try:
+                sheet = BottomSheet(context, True, provider)
+            except Exception:
+                sheet = BottomSheet(context, True)
+
+            background = self._theme_color("key_dialogBackground", provider)
+
+            root = LinearLayout(context)
+            root.setOrientation(LinearLayout.VERTICAL)
+            self._call_int_color(root, "setBackgroundColor", background)
+
+            title = TextView(context)
+            title.setText(self._t("editor_title_edit") if spec else self._t("editor_title_new"))
+            title.setTextSize(20)
+            try:
+                title.setTypeface(AndroidUtilities.bold())
+            except Exception:
+                pass
+            title.setPadding(self._dp(22), self._dp(16), self._dp(22), self._dp(6))
+            self._call_int_color(title, "setTextColor", self._theme_color("key_dialogTextBlack", provider))
+            root.addView(title, LayoutParams(-1, -2))
+
+            def make_input(hint: str, value: str, numeric: bool):
+                try:
+                    cell = EditTextCell(context, str(hint), False, False, -1, provider)
+                except Exception:
+                    cell = EditTextCell(context, str(hint), False)
+                if numeric:
+                    try:
+                        cell.editText.setInputType(int(InputType.TYPE_CLASS_NUMBER))
+                    except Exception:
+                        pass
+                if value:
+                    try:
+                        cell.setText(str(value))
+                    except Exception:
+                        pass
+                try:
+                    cell.setDivider(True)
+                except Exception:
+                    pass
+                root.addView(cell, LayoutParams(-1, -2))
+                return cell
+
+            id_cell = make_input(self._t("editor_id_hint"), str(state["gift_id"] or ""), True)
+            price_cell = make_input(
+                self._t("editor_price_hint"),
+                str(int(spec.get("stars", _CUSTOM_GIFT_DEFAULT_STARS)) if spec else _CUSTOM_GIFT_DEFAULT_STARS),
+                True,
+            )
+            pack_cell = make_input(self._t("editor_pack_hint"), str(state["pack"]), False)
+
+            try:
+                index_row = TextCell(context, provider)
+            except Exception:
+                index_row = TextCell(context)
+            self._update_index_row(index_row, int(state["index"]))
+            try:
+                index_row.setOnClickListener(
+                    OnClickListener(
+                        lambda _v=None: plugin._open_editor_sticker_picker(context, provider, state, pack_cell, index_row)
+                    )
+                )
+            except Exception:
+                pass
+            root.addView(index_row, LayoutParams(-1, self._dp(50)))
+
+            try:
+                button = ButtonWithCounterView(context, True, provider)
+            except Exception:
+                button = ButtonWithCounterView(context, provider)
+            button.setText(self._t("editor_save"), False)
+            try:
+                button.setOnClickListener(
+                    OnClickListener(
+                        lambda _v=None: plugin._save_gift_editor(sheet, state, id_cell, price_cell, pack_cell)
+                    )
+                )
+            except Exception:
+                pass
+            button_lp = LayoutParams(-1, self._dp(48))
+            button_lp.setMargins(self._dp(16), self._dp(14), self._dp(16), self._dp(8))
+            root.addView(button, button_lp)
+
+            if spec is not None:
+                try:
+                    delete_row = TextCell(context, provider)
+                except Exception:
+                    delete_row = TextCell(context)
+                delete_icon = self._icon("msg_delete")
+                try:
+                    if delete_icon:
+                        delete_row.setTextAndIcon(self._t("editor_delete"), int(delete_icon), False)
+                    else:
+                        delete_row.setText(self._t("editor_delete"), False)
+                except Exception:
+                    pass
+                try:
+                    Theme = jclass("org.telegram.ui.ActionBar.Theme")
+                    delete_row.setColors(Theme.key_text_RedBold, Theme.key_text_RedRegular)
+                except Exception:
+                    pass
+                try:
+                    delete_row.setOnClickListener(
+                        OnClickListener(lambda _v=None: plugin._delete_custom_gift(sheet, int(spec["id"])))
+                    )
+                except Exception:
+                    pass
+                root.addView(delete_row, LayoutParams(-1, self._dp(50)))
+
+            root.setPadding(0, 0, 0, self._dp(10))
+            sheet.setCustomView(root)
+            try:
+                sheet.fixNavigationBar(self._as_java_color(background))
+            except Exception:
+                try:
+                    self._call_int_color(sheet, "fixNavigationBar", background)
+                except Exception:
+                    pass
+
+            self._editor_sheet = sheet
+            self._editor_refs = [state]
+
+            try:
+                DismissListener = jclass("android.content.DialogInterface$OnDismissListener")
+
+                class _Dismiss(dynamic_proxy(DismissListener)):
+                    def onDismiss(self, dialog):
+                        try:
+                            plugin._on_editor_dismissed(sheet)
+                        except Exception:
+                            pass
+
+                dismiss_listener = _Dismiss()
+                self._editor_refs.append(dismiss_listener)
+                sheet.setOnDismissListener(dismiss_listener)
+            except Exception:
+                pass
+
+            sheet.show()
+        except Exception as e:
+            self.log(f"gift editor error: {e}")
+            self._notify_error(self._t("cfg_open_error"))
+
+    def _on_editor_dismissed(self, sheet: Any):
+        if self._editor_sheet is not sheet:
+            return
+        self._editor_sheet = None
+        self._editor_refs = []
+        self._pending_pack_picker = None
+
+    def _update_index_row(self, row: Any, index: int):
+        if row is None:
+            return
+        try:
+            row.setTextAndValue(
+                self._t("editor_index"),
+                self._t("editor_index_value", index=str(int(index))),
+                False,
+            )
+        except Exception as e:
+            self.log(f"index row update error: {e}")
+
+    def _open_editor_sticker_picker(self, context: Any, provider: Any, state: Dict[str, Any], pack_cell: Any, index_row: Any):
+        pack_name = self._custom_pack_name(self._cell_text(pack_cell))
+        state["pack"] = pack_name
+
+        if not (self._pack_docs.get(pack_name) or []):
+            self._pending_pack_picker = {
+                "pack": pack_name,
+                "context": context,
+                "provider": provider,
+                "state": state,
+                "row": index_row,
+            }
+            self._load_pack(pack_name)
+            self._notify_success(self._t("editor_pack_loading"))
+            return
+
+        self._show_sticker_index_picker(context, provider, pack_name, state, index_row)
+
+    def _show_sticker_index_picker(self, context: Any, provider: Any, pack_name: str, state: Dict[str, Any], index_row: Any):
+        pack_name = self._custom_pack_name(pack_name)
+        docs = self._pack_docs.get(pack_name) or []
+        if not docs:
+            self._notify_error(self._t("editor_pack_error", pack=pack_name))
+            return
+
+        max_index = max(0, len(docs) - 1)
+        current = max(0, min(self._normalize_custom_sticker_index(state.get("index")), max_index))
+
+        def apply(value: int):
+            state["index"] = int(value)
+            self._update_index_row(index_row, int(value))
+
+        self._show_number_picker(
+            context=context,
+            provider=provider,
+            title=self._t("editor_index_title"),
+            info=self._t("editor_index_info", pack=pack_name, max_index=str(max_index)),
+            min_value=0,
+            max_value=max_index,
+            value=current,
+            apply_text=self._t("editor_index_apply"),
+            on_apply=apply,
+        )
+
+    def _after_pack_loaded(self, pack_name: str):
+        self._refresh_gift_sheet()
+
+        pending = self._pending_pack_picker
+        if not isinstance(pending, dict):
+            return
+        if self._custom_pack_name(pending.get("pack")) != self._custom_pack_name(pack_name):
+            return
+
+        self._pending_pack_picker = None
+        if self._editor_sheet is None:
+            return
+
+        context = pending.get("context") or self._config_context()
+        self._show_sticker_index_picker(
+            context,
+            pending.get("provider"),
+            pack_name,
+            pending.get("state") or {},
+            pending.get("row"),
+        )
+
+    def _on_pack_failed(self, pack_name: str):
+        pending = self._pending_pack_picker
+        if not isinstance(pending, dict):
+            return
+        if self._custom_pack_name(pending.get("pack")) != self._custom_pack_name(pack_name):
+            return
+        self._pending_pack_picker = None
+        self._notify_error(self._t("editor_pack_error", pack=self._custom_pack_name(pack_name)))
+
+    def _save_gift_editor(self, sheet: Any, state: Dict[str, Any], id_cell: Any, price_cell: Any, pack_cell: Any):
+        gift_id = self._to_int(self._cell_text(id_cell))
+        if gift_id is None or gift_id <= 0 or gift_id == _CONFIG_GIFT_ID or gift_id in _BUILTIN_GIFT_SPECS_BY_ID:
+            self._notify_error(self._t("editor_missing_id"))
+            return
+
+        price = self._to_int(self._cell_text(price_cell))
+        if price is None or price <= 0:
+            price = _CUSTOM_GIFT_DEFAULT_STARS
+
+        pack_name = self._custom_pack_name(self._cell_text(pack_cell))
+        sticker_number = self._normalize_custom_sticker_index(state.get("index"))
+        docs = self._pack_docs.get(pack_name) or []
+        if docs:
+            sticker_number = max(0, min(int(sticker_number), len(docs) - 1))
+
+        original_id = self._to_int(state.get("gift_id"))
+        specs = [
+            spec
+            for spec in self._custom_gift_specs()
+            if int(spec["id"]) != int(gift_id) and (original_id is None or int(spec["id"]) != int(original_id))
+        ]
+        specs.append(
+            {
+                "id": int(gift_id),
+                "stars": int(price),
+                "sticker_number": int(sticker_number),
+                "pack": str(pack_name),
+            }
+        )
+
+        self._load_pack(pack_name)
+        self._store_custom_gifts(specs)
+        self._dismiss_editor_sheet(sheet)
+        self._notify_success(self._t("editor_saved"))
+
+    def _delete_custom_gift(self, sheet: Any, gift_id: int):
+        specs = [spec for spec in self._custom_gift_specs() if int(spec["id"]) != int(gift_id)]
+        self._store_custom_gifts(specs)
+        self._gift_cache.pop(int(gift_id), None)
+        self._dismiss_editor_sheet(sheet)
+        self._notify_success(self._t("editor_removed"))
+
+    def _dismiss_editor_sheet(self, sheet: Any = None):
+        target = sheet if sheet is not None else self._editor_sheet
+        if self._editor_sheet is target or sheet is None:
+            self._editor_sheet = None
+            self._editor_refs = []
+        self._pending_pack_picker = None
+        if target is None:
+            return
+        try:
+            target.dismiss()
+        except Exception:
+            pass
+
+    def _cell_text(self, cell: Any) -> str:
+        if cell is None:
+            return ""
+        try:
+            return str(cell.getText() or "").strip()
+        except Exception:
+            pass
+        try:
+            return str(cell.editText.getText() or "").strip()
+        except Exception:
+            return ""
+
+    def _icon(self, name: str) -> int:
+        try:
+            drawable = getattr(R_tg, "drawable", None)
+            return int(getattr(drawable, name, 0) or 0)
+        except Exception:
+            return 0
+
+    def _setting_bool(self, key: str, default: bool) -> bool:
+        try:
+            value = self.get_setting(key, default)
+        except Exception:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("true", "1", "yes"):
+            return True
+        if text in ("false", "0", "no"):
+            return False
+        return bool(default)
+
+    def _settings_delay_ms(self) -> int:
+        value = self._to_int(self.get_setting(_SETTING_DELAY, _DEFAULT_DELAY_MS))
+        if value is None or value < 0:
+            return _DEFAULT_DELAY_MS
+        return min(int(value), 10000)
+
+    def _settings_max_quantity(self) -> int:
+        value = self._to_int(self.get_setting(_SETTING_MAX_QUANTITY, _DEFAULT_MAX_QUANTITY))
+        if value is None or value <= 0:
+            return _DEFAULT_MAX_QUANTITY
+        return min(int(value), _MAX_QUANTITY_CEILING)
+
+    def _get_at(self, values: Any, index: int):
+        try:
+            return values[index]
+        except Exception:
+            pass
+        try:
+            return values.get(index)
+        except Exception:
+            return None
+
+    def _field(self, obj: Any, field_name: str, default: Any = None):
+        if obj is None:
+            return default
+        try:
+            return getattr(obj, field_name)
+        except Exception:
+            pass
+        try:
+            value = get_private_field(obj, field_name)
+            return default if value is None else value
+        except Exception:
+            return default
+
+    def _iter_java_items(self, value: Any) -> List[Any]:
+        if value is None:
+            return []
+        try:
+            return [item for item in value]
+        except Exception:
+            pass
+
+        items = []
+        try:
+            size = int(value.size())
+            for i in range(size):
+                items.append(value.get(i))
+            return items
+        except Exception:
+            pass
+
+        try:
+            size = int(len(value))
+            for i in range(size):
+                items.append(value[i])
+            return items
+        except Exception:
+            return items
+
+    def _notify_success(self, text: str):
+        run_on_ui_thread(lambda: BulletinHelper.show_success(str(text)))
+
+    def _notify_error(self, text: str):
+        run_on_ui_thread(lambda: BulletinHelper.show_error(str(text)))
+
+    def _get_ui_context(self):
+        fragment = None
+        activity = None
+        try:
+            fragment = get_last_fragment()
+            if fragment is not None:
+                activity = fragment.getParentActivity()
+        except Exception:
+            activity = None
+        return activity, fragment
+
+    def _current_account(self) -> int:
+        try:
+            UserConfig = jclass("org.telegram.messenger.UserConfig")
+            selected = int(getattr(UserConfig, "selectedAccount", 0) or 0)
+            if selected >= 0:
+                return selected
+        except Exception:
+            pass
+        try:
+            cfg = get_user_config()
+            if cfg is not None:
+                current = int(getattr(cfg, "currentAccount", 0) or 0)
+                if current >= 0:
+                    return current
+        except Exception:
+            pass
+        return 0
+
+    def _format_number(self, value: Any) -> str:
+        try:
+            LocaleController = jclass("org.telegram.messenger.LocaleController")
+            return str(LocaleController.formatNumber(int(value), ','))
+        except Exception:
+            try:
+                return f"{int(value):,}".replace(",", " ")
+            except Exception:
+                return str(value)
+
+    def _set_view_background(self, view: Any, background: Any):
+        if view is None or background is None:
+            return
+        try:
+            view.setBackground(background)
+        except Exception:
+            pass
+
+    def _apply_text_color(self, text_view: Any, theme_key_name: str, resources_provider: Any = None):
+        color = self._theme_color(theme_key_name, resources_provider)
+        if color:
+            self._call_int_color(text_view, "setTextColor", color)
+
+    def _call_int_color(self, target: Any, method_name: str, color: Any):
+        if target is None or not color:
+            return
+        value = self._as_java_color(color)
+        try:
+            method = target.getClass().getMethod(method_name, Integer.TYPE)
+            method.invoke(target, Integer(value))
+            return
+        except Exception:
+            pass
+        try:
+            getattr(target, method_name)(value)
+        except Exception as e:
+            self.log(f"{method_name} failed: {e}")
+
+    def _theme_color(self, key_name: str, resources_provider: Any = None) -> int:
+        try:
+            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+            key = getattr(Theme, key_name, None)
+            if key is None:
+                return 0
+            if resources_provider is not None:
+                try:
+                    return int(Theme.getColor(int(key), resources_provider))
+                except Exception:
+                    pass
+            return int(Theme.getColor(int(key)))
+        except Exception:
+            return 0
+
+    def _as_java_color(self, color: Any) -> int:
+        try:
+            value = int(color) & 0xFFFFFFFF
+        except Exception:
+            return 0
+        if value >= 0x80000000:
+            value -= 0x100000000
+        return int(value)
+
+    def _dp(self, value: int) -> int:
+        try:
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+            return int(AndroidUtilities.dp(float(value)))
+        except Exception:
+            return int(value)
+
+    def _to_int(self, value: Any) -> Optional[int]:
+        try:
+            text = str(value).strip()
+            if text == "":
+                return None
+            return int(text)
+        except Exception:
+            return None
+
+    def _as_java_long(self, value: Any):
+        try:
+            numeric = int(str(value).strip())
+        except Exception:
+            return 0
+        try:
+            Long = jclass("java.lang.Long")
+            return Long.valueOf(str(numeric))
+        except Exception as e:
+            self.log(f"java long conversion failed for {numeric}: {e}")
+            return 0
+
+    def _set_optional_star_gift_field(self, gift: Any, field_name: str, value: Any) -> bool:
+        try:
+            setattr(gift, field_name, value)
+            return True
+        except Exception:
+            return False
+
+    def _t(self, key: str, **kwargs) -> str:
+        text = _TEXTS.get(key, key)
+        try:
+            return text.format(**kwargs) if kwargs else text
+        except Exception:
+            return text

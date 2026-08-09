@@ -1,0 +1,392 @@
+__name__ = "Удалить длинный текст"
+__description__ = "Показывает кнопку очистки текста, когда введено больше 100 символов."
+__version__ = "1.1.0"
+__id__ = "long_text_delete_button"
+__author__ = "@Xarvyn"
+__icon__ = "exteraPlugins/0"
+__min_version__ = "11.12.0"
+
+import traceback
+
+from android_utils import run_on_ui_thread, OnClickListener
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from org.telegram.messenger import AndroidUtilities, R as TgR
+from android.view import Gravity, View
+from android.widget import FrameLayout, ImageView
+
+
+class TextWatcherHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.update_button(param.thisObject)
+        except Exception as e:
+            try:
+                self.plugin.log(f"[long_text_delete_button] hook error: {e}")
+                self.plugin.log(traceback.format_exc())
+            except Exception:
+                pass
+
+
+class LongTextDeleteButtonPlugin(BasePlugin):
+    LIMIT = 100
+    SIZE_DP = 36
+    RIGHT_DP = 8
+    BOTTOM_DP = 52
+
+    def __init__(self):
+        try:
+            super().__init__()
+        except Exception:
+            pass
+        self.hooks = []
+        self.buttons = {}
+        self.busy = set()
+        self.hook = TextWatcherHook(self)
+
+    def on_plugin_load(self):
+        try:
+            cls = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+            if cls is None:
+                self.log("[long_text_delete_button] ChatActivityEnterView not found")
+                return
+
+            for name in ("setDialogId", "setFieldText", "checkSendButton"):
+                try:
+                    items = self.hook_all_methods(cls, name, self.hook)
+                    if items:
+                        self.hooks.extend(items)
+                    self.log(f"[long_text_delete_button] hooked {name}")
+                except Exception as e:
+                    self.log(f"[long_text_delete_button] hook {name} failed: {e}")
+                    self.log(traceback.format_exc())
+        except Exception as e:
+            try:
+                self.log(f"[long_text_delete_button] on_plugin_load error: {e}")
+                self.log(traceback.format_exc())
+            except Exception:
+                pass
+
+    def on_plugin_unload(self):
+        try:
+            for item in list(self.hooks):
+                try:
+                    self.unhook_method(item)
+                except Exception as e:
+                    self.log(f"[long_text_delete_button] unhook failed: {e}")
+                    self.log(traceback.format_exc())
+            self.hooks.clear()
+
+            def cleanup():
+                try:
+                    for button in list(self.buttons.values()):
+                        try:
+                            parent = button.getParent()
+                            if parent is not None:
+                                parent.removeView(button)
+                        except Exception as e:
+                            self.log(f"[long_text_delete_button] remove view failed: {e}")
+                            self.log(traceback.format_exc())
+                    self.buttons.clear()
+                    self.busy.clear()
+                except Exception as e:
+                    self.log(f"[long_text_delete_button] cleanup failed: {e}")
+                    self.log(traceback.format_exc())
+
+            run_on_ui_thread(cleanup)
+        except Exception as e:
+            try:
+                self.log(f"[long_text_delete_button] on_plugin_unload error: {e}")
+                self.log(traceback.format_exc())
+            except Exception:
+                pass
+
+    def _key(self, view):
+        try:
+            if view is None:
+                return None
+            return int(view.hashCode())
+        except Exception as e:
+            try:
+                self.log(f"[long_text_delete_button] key error: {e}")
+                self.log(traceback.format_exc())
+            except Exception:
+                pass
+            return None
+
+    def _field(self, enter_view):
+        try:
+            if enter_view is None:
+                return None
+            for name in ("messageEditText", "messsageEditText"):
+                try:
+                    value = get_private_field(enter_view, name)
+                    if value is not None:
+                        return value
+                except Exception:
+                    pass
+            return None
+        except Exception as e:
+            try:
+                self.log(f"[long_text_delete_button] field error: {e}")
+                self.log(traceback.format_exc())
+            except Exception:
+                pass
+            return None
+
+    def _container(self, enter_view):
+        try:
+            if enter_view is None:
+                return None
+            for name in ("textFieldContainer", "messageEditTextContainer", "sendButtonContainer"):
+                try:
+                    value = get_private_field(enter_view, name)
+                    if value is not None:
+                        return value
+                except Exception:
+                    pass
+            return None
+        except Exception as e:
+            try:
+                self.log(f"[long_text_delete_button] container error: {e}")
+                self.log(traceback.format_exc())
+            except Exception:
+                pass
+            return None
+
+    def _schedule(self, enter_view):
+        try:
+            key = self._key(enter_view)
+            if key is None or key in self.busy:
+                return
+            self.busy.add(key)
+
+            def job():
+                try:
+                    self.update_button(enter_view)
+                except Exception as e:
+                    try:
+                        self.log(f"[long_text_delete_button] scheduled update failed: {e}")
+                        self.log(traceback.format_exc())
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        self.busy.discard(key)
+                    except Exception:
+                        pass
+
+            run_on_ui_thread(job)
+        except Exception as e:
+            try:
+                self.log(f"[long_text_delete_button] schedule error: {e}")
+                self.log(traceback.format_exc())
+            except Exception:
+                pass
+
+    def update_button(self, enter_view):
+        try:
+            if enter_view is None:
+                return
+
+            key = self._key(enter_view)
+            if key is None:
+                return
+
+            edit = self._field(enter_view)
+            parent = self._container(enter_view)
+
+            if edit is None or parent is None:
+                return
+
+            try:
+                parent.setClipChildren(False)
+            except Exception:
+                pass
+
+            try:
+                parent.setClipToPadding(False)
+            except Exception:
+                pass
+
+            button = self.buttons.get(key)
+            if button is None:
+                button = self._make_button(enter_view, parent, key, edit)
+                if button is None:
+                    return
+
+            try:
+                text = edit.getText()
+                text = "" if text is None else text.toString()
+                button.setVisibility(View.VISIBLE if len(text) > self.LIMIT else View.GONE)
+            except Exception as e:
+                self.log(f"[long_text_delete_button] visibility error: {e}")
+                self.log(traceback.format_exc())
+        except Exception as e:
+            try:
+                self.log(f"[long_text_delete_button] update_button error: {e}")
+                self.log(traceback.format_exc())
+            except Exception:
+                pass
+
+    def _make_button(self, enter_view, parent, key, edit):
+        try:
+            if enter_view is None or parent is None or edit is None:
+                return None
+
+            existing = self.buttons.get(key)
+            if existing is not None:
+                try:
+                    if existing.getParent() is not None:
+                        return existing
+                except Exception:
+                    pass
+
+            context = None
+            try:
+                context = parent.getContext()
+            except Exception:
+                try:
+                    context = edit.getContext()
+                except Exception:
+                    try:
+                        context = enter_view.getContext()
+                    except Exception:
+                        context = None
+
+            if context is None:
+                return None
+
+            button = ImageView(context)
+
+            res_id = 0
+            try:
+                res_id = TgR.drawable.msg_delete
+            except Exception:
+                pass
+
+            if not res_id:
+                try:
+                    res_id = context.getResources().getIdentifier("msg_delete", "drawable", "org.telegram.messenger")
+                except Exception as e:
+                    self.log(f"[long_text_delete_button] icon lookup error: {e}")
+                    self.log(traceback.format_exc())
+
+            if res_id:
+                try:
+                    button.setImageResource(res_id)
+                except Exception as e:
+                    self.log(f"[long_text_delete_button] icon set error: {e}")
+                    self.log(traceback.format_exc())
+
+            try:
+                button.setScaleType(ImageView.ScaleType.CENTER_INSIDE)
+            except Exception:
+                pass
+
+            try:
+                button.setClickable(True)
+            except Exception:
+                pass
+
+            try:
+                button.setFocusable(True)
+            except Exception:
+                pass
+
+            try:
+                button.setPadding(
+                    AndroidUtilities.dp(6),
+                    AndroidUtilities.dp(6),
+                    AndroidUtilities.dp(6),
+                    AndroidUtilities.dp(6),
+                )
+            except Exception:
+                pass
+
+            try:
+                button.setContentDescription("Очистить текст")
+            except Exception:
+                pass
+
+            try:
+                button.setBackgroundColor(0x00000000)
+            except Exception:
+                pass
+
+            try:
+                button.setAlpha(0.72)
+            except Exception:
+                pass
+
+            try:
+                button.setColorFilter(0xFF5D5D5D)
+            except Exception:
+                pass
+
+            params = FrameLayout.LayoutParams(
+                AndroidUtilities.dp(self.SIZE_DP),
+                AndroidUtilities.dp(self.SIZE_DP),
+                Gravity.BOTTOM | Gravity.END
+            )
+            params.rightMargin = AndroidUtilities.dp(self.RIGHT_DP)
+            params.bottomMargin = AndroidUtilities.dp(self.BOTTOM_DP)
+
+            try:
+                parent.addView(button, params)
+            except Exception as e:
+                self.log(f"[long_text_delete_button] add button error: {e}")
+                self.log(traceback.format_exc())
+                return None
+
+            try:
+                button.bringToFront()
+            except Exception:
+                pass
+
+            try:
+                button.setOnClickListener(OnClickListener(lambda v, view=enter_view: self.clear_text(view)))
+            except Exception as e:
+                self.log(f"[long_text_delete_button] click bind error: {e}")
+                self.log(traceback.format_exc())
+
+            self.buttons[key] = button
+            return button
+        except Exception as e:
+            try:
+                self.log(f"[long_text_delete_button] _make_button error: {e}")
+                self.log(traceback.format_exc())
+            except Exception:
+                pass
+            return None
+
+    def clear_text(self, enter_view):
+        try:
+            if enter_view is None:
+                return
+
+            edit = self._field(enter_view)
+            if edit is None:
+                return
+
+            try:
+                edit.setText("")
+            except Exception as e:
+                self.log(f"[long_text_delete_button] clear error: {e}")
+                self.log(traceback.format_exc())
+
+            try:
+                edit.setSelection(0)
+            except Exception:
+                pass
+
+            self._schedule(enter_view)
+        except Exception as e:
+            try:
+                self.log(f"[long_text_delete_button] clear_text error: {e}")
+                self.log(traceback.format_exc())
+            except Exception:
+                pass

@@ -1,0 +1,3590 @@
+__id__ = "wsbypass"
+__name__ = "WS-Bypass"
+__description__ = "Обход блокировок Telegram"
+__icon__ = "ResistanceDog/24"
+__author__ = "@Th3Nek1t_projects"
+__version__ = "2.4.4"
+__app_version__ = ">=12.5.1" 
+__sdk_version__ = ">=1.4.0"
+import base64
+import binascii
+import hashlib
+import json
+import os
+import random
+import re
+import socket
+import struct
+import threading
+import time
+try:
+    import ssl
+except Exception:
+    ssl = None
+try:
+    import certifi
+    _CA_BUNDLE = certifi.where()
+except Exception:
+    _CA_BUNDLE = True
+import requests
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from android_utils import log, run_on_ui_thread
+from ui.settings import Header, Switch, Text, Divider, Input
+from ui.bulletin import BulletinHelper
+from hook_utils import find_class, get_private_field
+from client_utils import get_last_fragment, run_on_queue, send_request, RequestCallback
+from java.util import Locale
+from org.telegram.messenger import (
+    SharedConfig, MessagesController, NotificationCenter, UserConfig, LocaleController,
+)
+from org.telegram.tgnet import ConnectionsManager, TLRPC
+try:
+    from javax.crypto import Cipher as JavaCipher
+    from javax.crypto.spec import SecretKeySpec, IvParameterSpec
+except Exception:
+    JavaCipher = None
+    SecretKeySpec = None
+    IvParameterSpec = None
+try:
+    from java import jclass
+except Exception:
+    jclass = None
+DEFAULT_LOCAL_PROXY_PORT = 1443
+TGWS_LOCAL_PORT = DEFAULT_LOCAL_PROXY_PORT
+TGWS_WS_CONNECT_TIMEOUT_SEC = float(os.getenv("TGWS_WS_CONNECT_TIMEOUT_SEC", "4"))
+TGWS_SOFT_START_DELAY_SEC = float(os.getenv("TGWS_SOFT_START_DELAY_SEC", "0"))
+# Delay before UI-triggered (re)starts: at least 800 ms to let the old listener die.
+TGWS_SOFT_RESTART_DELAY_MS = int(max(800.0, TGWS_SOFT_START_DELAY_SEC * 1000))
+# [v2.4.2 warmup] Keep warm CF spares ready so a reconnect skips the TLS+WS
+# handshake (the slow, high-ping, DPI-fingerprintable part) and is near-instant.
+# ON by default now (the connect() fd-leak it used to re-exercise is fixed below).
+TGWS_WARMUP_ON_START = str(os.getenv("TGWS_WARMUP_ON_START", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+TGWS_WARMUP_DELAY_SEC = float(os.getenv("TGWS_WARMUP_DELAY_SEC", "4"))
+TGWS_WARMUP_STAGGER_SEC = float(os.getenv("TGWS_WARMUP_STAGGER_SEC", "0.4"))
+# How many warm CF spares to keep per active (dc,is_media) key, the global cap,
+# how fresh a spare may be (held spares can be silently throttled, so keep them
+# young), the top-up cadence, how long a (dc,is_media) counts as "active" since
+# last real use, and how many CF domains _warm_one_spare tries before giving up.
+TGWS_WS_SPARE_PER_KEY = int(float(os.getenv("TGWS_WS_SPARE_PER_KEY", "2")))
+TGWS_WS_SPARE_MAX = int(float(os.getenv("TGWS_WS_SPARE_MAX", "8")))
+TGWS_WS_SPARE_MAX_AGE_SEC = float(os.getenv("TGWS_WS_SPARE_MAX_AGE_SEC", "18"))
+TGWS_WS_WARM_INTERVAL_SEC = float(os.getenv("TGWS_WS_WARM_INTERVAL_SEC", "3"))
+TGWS_WS_ACTIVE_KEY_TTL_SEC = float(os.getenv("TGWS_WS_ACTIVE_KEY_TTL_SEC", "300"))
+TGWS_WS_WARM_DOMAINS_TRY = int(float(os.getenv("TGWS_WS_WARM_DOMAINS_TRY", "3")))
+# [v2.4.3 keepalive] Hold a quiet-but-ALIVE tunnel instead of tearing it down at the
+# first idle gap (that was the "reconnect every few seconds" churn). When the upstream
+# is idle for IDLE_PING_SEC, send a WS ping and wait PONG_WAIT_SEC for a pong/data:
+# pong/data => alive (keep); nothing => dead/throttled => drop immediately (so a
+# strangled tunnel never inflates the ping). A purely-idle-but-alive tunnel is recycled
+# only after MAX_IDLE such cycles (~IDLE_PING_SEC*MAX_IDLE seconds) => reconnects drop
+# from every few seconds to about once a minute, while active tunnels hold indefinitely.
+TGWS_BRIDGE_KEEPALIVE = str(os.getenv("TGWS_BRIDGE_KEEPALIVE", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+TGWS_BRIDGE_IDLE_PING_SEC = float(os.getenv("TGWS_BRIDGE_IDLE_PING_SEC", "20"))
+TGWS_BRIDGE_PONG_WAIT_SEC = float(os.getenv("TGWS_BRIDGE_PONG_WAIT_SEC", "5"))
+TGWS_BRIDGE_MAX_IDLE = int(float(os.getenv("TGWS_BRIDGE_MAX_IDLE", "3")))
+TGWS_AUTOSTART_DELAY_MS = int(float(os.getenv("TGWS_AUTOSTART_DELAY_MS", "0")))
+TGWS_RESUME_START_DELAY_MS = int(float(os.getenv("TGWS_RESUME_START_DELAY_MS", "0")))
+TGWS_CF_REFRESH_DELAY_SEC = float(os.getenv("TGWS_CF_REFRESH_DELAY_SEC", "45"))
+TGWS_SHOW_SUCCESS_BULLETIN = str(os.getenv("TGWS_SHOW_SUCCESS_BULLETIN", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+LOCAL_PROXY_HOST = "127.0.0.1"
+local_proxy_host = LOCAL_PROXY_HOST
+# Friendly title shown for our own entry in Telegram's proxy panel. Telegram's
+# proxy-list cell hardcodes the title to "address:port" (ProxyInfo has no name
+# field), so we relabel only OUR 127.0.0.1 row via a post-hook on the cell.
+TGWS_PROXY_LABEL = "Обход блокировок"
+
+
+class _TgwsProxyLabelHook(MethodHook):
+    # Post-hook on ProxyListActivity$TextDetailProxyCell.setProxy(ProxyInfo).
+    # After the cell renders "127.0.0.1:port", overwrite the title TextView with
+    # a human-readable label — but ONLY for our local entry; all other proxies
+    # are left untouched. Fully guarded: any shape mismatch silently no-ops and
+    # the row just keeps showing the raw address.
+    def after_hooked_method(self, param):
+        try:
+            args = getattr(param, "args", None)
+            if not args:
+                return
+            info = args[0]
+            if info is None:
+                return
+            if str(getattr(info, "address", "")) != LOCAL_PROXY_HOST:
+                return
+            cell = getattr(param, "thisObject", None)
+            if cell is None:
+                return
+            tv = get_private_field(cell, "textView")
+            if tv is not None:
+                tv.setText(TGWS_PROXY_LABEL)
+        except Exception:
+            pass
+# Guards LOCAL_PROXY_HOST mutations and SharedConfig.proxyList iteration/mutation.
+# RLock so the same thread can re-enter (e.g. _apply_runtime_local_host -> _local_host).
+_TGWS_HOST_LOCK = threading.RLock()
+_TGWS_PROXYLIST_LOCK = threading.RLock()
+# [v2.1 coexist] guard against re-entrant proxySettingsChanged posts when
+# other proxy-management plugins (e.g. th3_proxy_tools.plugin) are active.
+_TGWS_NOTIFY_LOCK = threading.Lock()
+_TGWS_NOTIFY_IN_FLIGHT = False
+# [perf-01 redo] Reflection Field cache. Key f"{cls.getName()}::{name}" is stable
+# across plugin reloads (unlike id(cls), which changes when the class is reloaded
+# and can be recycled to alias a different class). Lazy-filled under a dedicated
+# Lock; getDeclaredField + setAccessible runs once per (class, field).
+# ---------------------------------------------------------------------------
+# WHY THIS PLUGIN USES JAVA REFLECTION (security-review note)
+# ---------------------------------------------------------------------------
+# exteraGram exposes no public API to fully drive Telegram's proxy state from a
+# plugin. To install its purely-LOCAL 127.0.0.1 MTProto proxy the plugin has to:
+#   * set a few SharedConfig statics that have no public setter
+#     (useProxySettings, proxyEnabled, currentProxyInfo);
+#   * read ProxyInfo's private fields (address/port/username/password/secret) to
+#     SNAPSHOT the user's existing proxy so it can be restored verbatim on disable.
+# Reflection is therefore used ONLY for these proxy-config fields. It never loads
+# code, never reads the filesystem, and never touches unrelated app state. Public
+# APIs (SharedConfig.addProxy/deleteProxy, ConnectionsManager.setProxySettings) are
+# preferred wherever they exist; reflection is the documented exteraGram-plugin
+# fallback for the gaps they leave. Fields are resolved once and cached below.
+# ---------------------------------------------------------------------------
+_TGWS_FIELD_CACHE = {}
+_FIELD_CACHE_LOCK = threading.Lock()
+def _tgws_cached_field(cls, name):
+    try:
+        cls_name = str(cls.getName())
+    except Exception:
+        cls_name = str(cls)
+    key = f"{cls_name}::{name}"
+    with _FIELD_CACHE_LOCK:
+        try:
+            return _TGWS_FIELD_CACHE[key]
+        except KeyError:
+            f = cls.getDeclaredField(str(name))
+            f.setAccessible(True)
+            _TGWS_FIELD_CACHE[key] = f
+            return f
+TGWS_WS_FAIL_COOLDOWN_SEC = 30.0
+TGWS_WS_FAIL_COOLDOWN_MAX_SEC = float(os.getenv("TGWS_WS_FAIL_COOLDOWN_MAX_SEC", "300"))
+TGWS_WS_BLACKLIST_TTL_SEC = float(os.getenv("TGWS_WS_BLACKLIST_TTL_SEC", "420"))
+TGWS_WS_POOL_KEEPER_INTERVAL_SEC = float(os.getenv("TGWS_WS_POOL_KEEPER_INTERVAL_SEC", "30"))
+TGWS_TCP_KEEPIDLE_SEC = int(float(os.getenv("TGWS_TCP_KEEPIDLE_SEC", "300")))
+TGWS_TCP_KEEPINTVL_SEC = int(float(os.getenv("TGWS_TCP_KEEPINTVL_SEC", "60")))
+TGWS_TCP_KEEPCNT = int(float(os.getenv("TGWS_TCP_KEEPCNT", "3")))
+TGWS_DEFAULT_DC_IP = {
+    "2": "149.154.167.220",
+    "4": "149.154.167.220",
+}
+TGWS_DC_OVERRIDES = {
+    203: 2,
+}
+TGWS_TCP_NODELAY = True
+TGWS_SOCK_RCVBUF = int(os.getenv("TGWS_SOCK_RCVBUF", str(256 * 1024)))
+TGWS_SOCK_SNDBUF = int(os.getenv("TGWS_SOCK_SNDBUF", str(512 * 1024)))
+# recv() chunk size for both bridge directions (TCP fallback and WS).
+TGWS_RECV_CHUNK = 256 * 1024
+TGWS_WS_FAIL_TIMEOUT_SEC = float(os.getenv("TGWS_WS_FAIL_TIMEOUT_SEC", "2"))
+# [v2.3 sticky-lane] Consecutive failures the current sticky lane must accumulate
+# before the other lane is allowed to take over as the per-DC default. Dampens
+# CF<->direct flapping caused by a single transient miss.
+TGWS_LANE_HYSTERESIS = int(float(os.getenv("TGWS_LANE_HYSTERESIS", "2")))
+# Primary source + jsDelivr mirrors. The mirrors stay reachable when RKN blocks
+# raw.githubusercontent.com, so the CF domain pool keeps refreshing from Flowseal
+# instead of being stuck on the baked-in defaults.
+CFPROXY_DOMAINS_URLS = (
+    "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt",
+    "https://cdn.jsdelivr.net/gh/Flowseal/tg-ws-proxy@main/.github/cfproxy-domains.txt",
+    "https://fastly.jsdelivr.net/gh/Flowseal/tg-ws-proxy@main/.github/cfproxy-domains.txt",
+)
+_TGWS_CFPROXY_ENC = [
+    "virkgj.com",
+    "vmmzovy.com",
+    "mkuosckvso.com",
+    "zaewayzmplad.com",
+    "twdmbzcm.com",
+    "awzwsldi.com",
+    "clngqrflngqin.com",
+    "tjacxbqtj.com",
+    "bxaxtxmrw.com",
+    "dmohrsgmohcrwb.com",
+    "vwbmtmoi.com",
+    "khgrre.com",
+    "ulihssf.com",
+    "tmhqsdqmfpmk.com",
+    "xwuwoqbm.com",
+]
+_TGWS_CFPROXY_S = "".join(chr(c) for c in (46, 99, 111, 46, 117, 107))
+_TGWS_HOST_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
+)
+_TGWS_MAX_DOMAINS = 256
+def _tgws_valid_host(h):
+    try:
+        s = str(h or "").strip().lower()
+    except Exception:
+        return None
+    if not s or len(s) > 253 or ".." in s:
+        return None
+    if not _TGWS_HOST_RE.match(s):
+        return None
+    return s
+def _tgws_dd(s):
+    try:
+        ss = str(s or "")
+    except Exception:
+        return s
+    if not ss.endswith(".com"):
+        return ss
+    p = ss[:-4]
+    try:
+        n = sum(1 for c in p if ("a" <= c <= "z") or ("A" <= c <= "Z"))
+    except Exception:
+        n = 0
+    out = []
+    for c in p:
+        o = ord(c)
+        if 97 <= o <= 122:
+            out.append(chr((o - 97 - n) % 26 + 97))
+        elif 65 <= o <= 90:
+            out.append(chr((o - 65 - n) % 26 + 65))
+        else:
+            out.append(c)
+    return "".join(out) + _TGWS_CFPROXY_S
+def _tgws_fetch_cfproxy_domains():
+    # Try each source in order; the first one that yields valid domains wins. A
+    # cache-buster is appended so blocked-but-cached responses don't mask a fresh
+    # list. Falls through to the next mirror on any error / non-200 / empty parse.
+    cb = "".join(random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", k=7))
+    for base in CFPROXY_DOMAINS_URLS:
+        try:
+            url = str(base) + "?" + cb
+            r = requests.get(url, timeout=10, headers={"User-Agent": "tg-ws-proxy"}, verify=_CA_BUNDLE)
+            if getattr(r, "status_code", 0) != 200:
+                continue
+            text = str(getattr(r, "text", "") or "")
+            if len(text) > 65536:
+                text = text[:65536]
+            out = []
+            seen = set()
+            for line in text.splitlines():
+                s = str(line or "").strip()
+                if not s or s.startswith("#"):
+                    continue
+                dd = _tgws_valid_host(_tgws_dd(s))
+                if dd and dd not in seen:
+                    seen.add(dd)
+                    out.append(dd)
+                    if len(out) >= _TGWS_MAX_DOMAINS:
+                        break
+            if out:
+                return out
+        except Exception:
+            continue
+    return []
+_tgws_cf_refresh_stop = threading.Event()
+def _tgws_start_cfproxy_domain_refresh(on_update):
+    global _tgws_cf_refresh_stop
+    try:
+        _tgws_cf_refresh_stop.set()
+    except Exception:
+        pass
+    _tgws_cf_refresh_stop = threading.Event()
+    stop = _tgws_cf_refresh_stop
+    try:
+        defaults = [h for h in (_tgws_valid_host(_tgws_dd(d)) for d in list(_TGWS_CFPROXY_ENC)) if h]
+    except Exception:
+        defaults = []
+    try:
+        if callable(on_update):
+            on_update(defaults)
+    except Exception:
+        pass
+    def _loop():
+        try:
+            try:
+                first_delay = max(0.0, float(TGWS_CF_REFRESH_DELAY_SEC))
+            except Exception:
+                first_delay = 25.0
+            try:
+                if stop.wait(timeout=first_delay):
+                    return
+            except Exception:
+                return
+            try:
+                pool = _tgws_fetch_cfproxy_domains()
+                if pool and callable(on_update):
+                    on_update(pool)
+            except Exception:
+                pass
+            while True:
+                try:
+                    if stop.wait(timeout=3600):
+                        return
+                except Exception:
+                    return
+                try:
+                    pool = _tgws_fetch_cfproxy_domains()
+                    if pool and callable(on_update):
+                        on_update(pool)
+                except Exception:
+                    continue
+        except Exception:
+            return
+    try:
+        threading.Thread(target=_loop, daemon=True, name="tgws-cfproxy-refresh").start()
+    except Exception:
+        pass
+TRANSLATIONS = {
+    "settings_header": ("TG-WS", "TG-WS"),
+    "connection_settings": ("Подключение", "Connection"),
+    "enable_plugin": ("Включить TG WS", "Enable TG WS"),
+    "open_tg_settings": ("Настройки прокси Telegram", "Telegram proxy settings"),
+    "advanced_settings": ("Расширенные настройки", "Advanced settings"),
+    "local_host": ("Локальный хост", "Local host"),
+    "local_port": ("Локальный порт", "Local port"),
+    "local_port_invalid": ("Неверный порт", "Invalid port"),
+    "local_port_busy": ("Порт занят", "Port is busy"),
+    "local_port_desc": ("Порт локального MTProto-прокси. Оставьте авто, если не знаете, зачем это.", "Local MTProto proxy port. Leave auto unless you know why you need this."),
+    "state_connected": ("Обходит блокировку", "Bypassing the block"),
+    "state_starting": ("Запускается…", "Starting…"),
+    "state_failed": ("Не удалось запуститься", "Couldn’t start"),
+    "state_off": ("Выключено", "Off"),
+    "tgws_status": ("TG-WS", "TG-WS"),
+    "tgws_connect_failed": ("TG-WS не подключился", "TG-WS failed to connect"),
+    "tgws_connected": ("TG-WS подключен", "TG-WS connected"),
+    "tgws_timeout": ("TG-WS: таймаут", "TG-WS: timeout"),
+    "tgws_no_port": ("Нет свободного порта", "No free port"),
+    "java_crypto_missing": ("Java crypto недоступно", "Java crypto is unavailable"),
+    "menu_settings": ("TG-WS", "TG-WS"),
+    "about": ("Плагин помогает Telegram работать, когда его блокируют. Он создаёт локальный прокси и пропускает через него трафик, обходя ограничения провайдера. Достаточно включить переключатель — всё остальное произойдёт автоматически.", "Keeps Telegram working when it's blocked. It creates a local proxy and routes traffic through it, getting around your provider's restrictions. Just turn on the switch and the rest happens automatically."),
+    "author_channel": ("Канал автора", "Author's channel"),
+}
+def _is_ru_token(v):
+    try:
+        s = str(v or "").strip().lower()
+    except Exception:
+        return False
+    if not s:
+        return False
+    if s.startswith("ru") or s.startswith("рус"):
+        return True
+    if " ru" in (" " + s) or "ru_" in s or "ru-" in s:
+        return True
+    if "рус" in s:
+        return True
+    return False
+def _is_ru_language():
+    try:
+        lc = LocaleController.getInstance()
+        if lc is not None:
+            for method_name in ("getCurrentLocaleInfo", "getCurrentLocale", "getCurrentLangCode", "getCurrentLanguageName"):
+                try:
+                    member = getattr(lc, method_name, None)
+                    val = member() if callable(member) else member
+                    if _is_ru_token(val):
+                        return True
+                    for attr in ("shortName", "pluralLangCode", "langCode", "name", "nameEnglish"):
+                        try:
+                            if _is_ru_token(getattr(val, attr, None)):
+                                return True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            for attr in ("currentLocaleInfo", "currentLocale", "currentLangCode"):
+                try:
+                    val = getattr(lc, attr, None)
+                    if _is_ru_token(val):
+                        return True
+                    for subattr in ("shortName", "pluralLangCode", "langCode", "name", "nameEnglish"):
+                        try:
+                            if _is_ru_token(getattr(val, subattr, None)):
+                                return True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        if _is_ru_token(Locale.getDefault().getLanguage()):
+            return True
+        if _is_ru_token(Locale.getDefault().toString()):
+            return True
+    except Exception:
+        pass
+    return False
+def Z(key):
+    idx = 0 if _is_ru_language() else 1
+    try: return str(TRANSLATIONS.get(key, (key, key))[idx])
+    except Exception: return str(key)
+def _log(message):
+    try:
+        log(str(message))
+    except Exception:
+        pass
+def _apply_tg_proxy(port, enable, socks_user="", socks_pass="", secret=""):
+    # ------------------------------------------------------------------------
+    # [security-review note] Installs (enable=True) or removes (enable=False) the
+    # plugin's OWN proxy entry. The host is ALWAYS 127.0.0.1 (LOCAL_PROXY_HOST),
+    # pointing at the in-process MTProto listener — never a remote endpoint.
+    # It writes ONLY Telegram's proxy configuration:
+    #   * SharedConfig proxy list (add/remove the local entry, dedupe stale copies)
+    #   * the "proxy_*" keys in the global main SharedPreferences
+    #   * ConnectionsManager.setProxySettings(...) per active account
+    # so the client routes its traffic through the local tunnel. It does NOT send,
+    # collect or exfiltrate any user data: the MTProto stream stays end-to-end
+    # encrypted between the Telegram client and Telegram's servers — this function
+    # only flips LOCAL routing. On disable it deletes exactly the 127.0.0.1 entry it
+    # created. p2p for calls is forced to "always" only while a secret-based proxy is
+    # active, and the user's previous calls_p2p value is backed up and restored on
+    # disable (see the tgws_proxy_p2p_backup_* keys below).
+    # ------------------------------------------------------------------------
+    try:
+        ProxyInfoClass = find_class("org.telegram.messenger.SharedConfig$ProxyInfo")
+        try:
+            SharedConfig.loadProxyList()
+        except Exception:
+            pass
+        local_proxy = None
+        try:
+            # [lock-3 redo] Snapshot proxyList under _TGWS_PROXYLIST_LOCK, then scan
+            # the copy OUTSIDE the lock (no concurrent-modification while iterating a
+            # live Java list). deleteProxy mutations are re-taken under the lock.
+            try:
+                with _TGWS_PROXYLIST_LOCK:
+                    pl = SharedConfig.proxyList if hasattr(SharedConfig, "proxyList") else None
+                    proxy_snapshot = list(pl) if pl else []
+            except Exception:
+                proxy_snapshot = []
+            duplicates = []
+            for p in proxy_snapshot:
+                try:
+                    if str(p.address) == LOCAL_PROXY_HOST:
+                        if local_proxy is None:
+                            local_proxy = p
+                        else:
+                            duplicates.append(p)
+                except Exception:
+                    continue
+            for p in duplicates:
+                try:
+                    with _TGWS_PROXYLIST_LOCK:
+                        SharedConfig.deleteProxy(p)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        ed = MessagesController.getGlobalMainSettings().edit()
+        try:
+            proxy_list = SharedConfig.proxyList
+            if proxy_list:
+                to_remove = []
+                for i in range(proxy_list.size()):
+                    p = proxy_list.get(i)
+                    if str(p.address) == LOCAL_PROXY_HOST:
+                        to_remove.append(p)
+                for p in to_remove:
+                    SharedConfig.deleteProxy(p)
+        except Exception:
+            pass
+        try:
+            curr = SharedConfig.currentProxy
+            if curr and str(curr.address) == LOCAL_PROXY_HOST:
+                SharedConfig.currentProxy = None
+        except Exception:
+            pass
+        if enable:
+            _secret = str(secret or "").strip()
+            _su = "" if _secret else str(socks_user or "")
+            _sp = "" if _secret else str(socks_pass or "")
+            # Reuse the existing 127.0.0.1 entry if one is present (mutate in place so
+            # it stays in the visible proxyList); otherwise create a fresh one via the
+            # stock SharedConfig.addProxy. This is the v10/11/12 logic that reliably
+            # shows the entry in Telegram's proxy list.
+            if local_proxy is not None:
+                try:
+                    local_proxy.port = int(port)
+                    local_proxy.username = _su
+                    local_proxy.password = _sp
+                    local_proxy.secret = _secret
+                except Exception:
+                    pass
+                proxy_obj = local_proxy
+            else:
+                proxy_obj = None
+                try:
+                    proxy_obj = SharedConfig.addProxy(LOCAL_PROXY_HOST, int(port), _su, _sp, _secret)
+                except Exception:
+                    proxy_obj = None
+                if not proxy_obj:
+                    try:
+                        proxy_obj = ProxyInfoClass(LOCAL_PROXY_HOST, int(port), _su, _sp, _secret)
+                        try:
+                            SharedConfig.addProxy(proxy_obj)
+                        except Exception:
+                            pass
+                    except Exception:
+                        proxy_obj = None
+            try:
+                if proxy_obj:
+                    SharedConfig.currentProxy = proxy_obj
+                    try:
+                        sc_cls = find_class("org.telegram.messenger.SharedConfig")
+                        for _fname, _fval in (("currentProxyInfo", proxy_obj), ("currentProxy", proxy_obj), ("useProxySettings", True), ("proxyEnabled", True)):
+                            try:
+                                _f = _tgws_cached_field(sc_cls, str(_fname))
+                                _f.set(None, _fval)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                SharedConfig.proxyEnabled = True
+            except Exception:
+                pass
+            ed.putString("proxy_ip", LOCAL_PROXY_HOST)
+            ed.putInt("proxy_port", int(port))
+            try:
+                ed.putString("proxy_user", _su)
+                ed.putString("proxy_pass", _sp)
+            except Exception:
+                pass
+            ed.putString("proxy_secret", _secret)
+            ed.putBoolean("proxy_enabled", True)
+            _calls_enabled = False if _secret else True
+            for key in ("proxy_enabled_calls", "proxy_calls_enabled", "calls_use_proxy"):
+                try:
+                    ed.putBoolean(key, bool(_calls_enabled))
+                except Exception:
+                    pass
+            try:
+                for attr in ("proxyEnabledCalls", "proxyCallsEnabled", "callsEnabled", "useProxyForCalls"):
+                    try:
+                        setattr(SharedConfig, attr, bool(_calls_enabled))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if proxy_obj:
+                try:
+                    for attr in ("enabledForCalls", "useForCalls"):
+                        try:
+                            setattr(proxy_obj, attr, bool(_calls_enabled))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            if _calls_enabled:
+                try:
+                    for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                        try:
+                            prefs = MessagesController.getInstance(ac).getSharedPreferences("mainconfig", 0)
+                            if prefs:
+                                p2p_prev_key = "tgws_proxy_p2p_backup_" + str(ac)
+                                current_p2p = prefs.getInt("calls_p2p", -1)
+                                if current_p2p != 2:
+                                    prefs.edit().putInt(p2p_prev_key, current_p2p).putInt("calls_p2p", 2).commit()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        else:
+            try:
+                curr = SharedConfig.currentProxy
+                if curr and str(curr.address) == LOCAL_PROXY_HOST:
+                    SharedConfig.currentProxy = None
+            except Exception:
+                pass
+            try:
+                SharedConfig.proxyEnabled = False
+            except Exception:
+                pass
+            try:
+                sc_cls = find_class("org.telegram.messenger.SharedConfig")
+                for _fname, _fval in (("useProxySettings", False), ("proxyEnabled", False)):
+                    try:
+                        _f = _tgws_cached_field(sc_cls, str(_fname))
+                        _f.set(None, _fval)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            ed.putBoolean("proxy_enabled", False)
+            try:
+                for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                    try:
+                        try:
+                            _uc = UserConfig.getInstance(ac)
+                            if _uc is None or not bool(_uc.isClientActivated()):
+                                continue
+                        except Exception:
+                            pass
+                        prefs = MessagesController.getInstance(ac).getSharedPreferences("mainconfig", 0)
+                        if prefs:
+                            p2p_prev_key = "tgws_proxy_p2p_backup_" + str(ac)
+                            saved_p2p = prefs.getInt(p2p_prev_key, -1)
+                            if saved_p2p >= 0:
+                                prefs.edit().putInt("calls_p2p", saved_p2p).remove(p2p_prev_key).apply()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            ed.commit()
+        except Exception:
+            ed.apply()
+        try:
+            SharedConfig.saveProxyList()
+        except Exception:
+            pass
+        try:
+            SharedConfig.saveConfig()
+        except Exception:
+            pass
+        _secret2 = str(secret or "").strip()
+        _su2 = "" if _secret2 else str(socks_user or "")
+        _sp2 = "" if _secret2 else str(socks_pass or "")
+        for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+            try:
+                try:
+                    _uc = UserConfig.getInstance(ac)
+                    if _uc is None or not bool(_uc.isClientActivated()):
+                        continue
+                except Exception:
+                    pass
+                cm = ConnectionsManager.getInstance(ac)
+                if cm:
+                    if enable:
+                        cm.setProxySettings(True, LOCAL_PROXY_HOST, int(port), _su2, _sp2, _secret2)
+                    else:
+                        cm.setProxySettings(False, "", 0, "", "", "")
+            except Exception:
+                pass
+        try:
+            if enable:
+                ConnectionsManager.setProxySettings(True, LOCAL_PROXY_HOST, int(port), _su2, _sp2, _secret2)
+            else:
+                ConnectionsManager.setProxySettings(False, "", 0, "", "", "")
+        except Exception:
+            pass
+        # [v2.1 coexist] re-entrance guard: если другой плагин (или мы сами) в
+        # этот момент уже шлёт proxySettingsChanged, не плодим вторичный пост,
+        # чтобы не было notification-каскада с th3_proxy_tools и его пирами.
+        def _notify():
+            global _TGWS_NOTIFY_IN_FLIGHT
+            try:
+                with _TGWS_NOTIFY_LOCK:
+                    if _TGWS_NOTIFY_IN_FLIGHT:
+                        return
+                    _TGWS_NOTIFY_IN_FLIGHT = True
+                try:
+                    try:
+                        from java import jarray
+                        from java.lang import Object
+                        NotificationCenter.getGlobalInstance().postNotificationName(
+                            NotificationCenter.proxySettingsChanged, jarray(Object)(0)
+                        )
+                    except Exception:
+                        NotificationCenter.getGlobalInstance().postNotificationName(
+                            NotificationCenter.proxySettingsChanged
+                        )
+                finally:
+                    with _TGWS_NOTIFY_LOCK:
+                        _TGWS_NOTIFY_IN_FLIGHT = False
+            except Exception:
+                try:
+                    with _TGWS_NOTIFY_LOCK:
+                        _TGWS_NOTIFY_IN_FLIGHT = False
+                except Exception:
+                    pass
+        try:
+            run_on_ui_thread(_notify, 300)
+        except Exception:
+            pass
+    except Exception as e:
+        _log(f"apply_tg_proxy error: {e}")
+def _get_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((LOCAL_PROXY_HOST, 0))
+        return s.getsockname()[1]
+def _tgws_lower_thread_priority():
+    # [perf upload] Drop the calling bridge thread below NORM priority so the
+    # JVM/Android scheduler favors the UI thread during heavy transfers. Bridge
+    # threads are pure I/O+crypto relays; a small deprioritization removes UI jank
+    # at negligible throughput cost. Uses NORM-2 (not MIN) to avoid starving the
+    # transfer on a busy device. Advisory + best-effort; never fatal.
+    try:
+        if jclass is not None:
+            _JThread = jclass("java.lang.Thread")
+            _target = max(int(_JThread.MIN_PRIORITY), int(_JThread.NORM_PRIORITY) - 2)
+            _JThread.currentThread().setPriority(_target)
+    except Exception:
+        pass
+def _tgws_xor_mask(data, mask):
+    if not mask:
+        return data
+    buf = bytearray(data)
+    for idx in range(len(buf)):
+        buf[idx] ^= mask[idx & 3]
+    return bytes(buf)
+def _tgws_build_frame(opcode, payload, mask=True):
+    try:
+        body = bytes(payload or b"")
+    except (TypeError, ValueError):
+        body = b""
+    out = bytearray()
+    out.append(0x80 | (int(opcode) & 0x0F))
+    length = len(body)
+    mask_bit = 0x80 if mask else 0x00
+    if length < 126:
+        out.append(mask_bit | length)
+    elif length <= 0xFFFF:
+        out.append(mask_bit | 126)
+        out.extend(struct.pack(">H", length))
+    else:
+        out.append(mask_bit | 127)
+        out.extend(struct.pack(">Q", length))
+    if mask:
+        mask_key = os.urandom(4)
+        out.extend(mask_key)
+        if length:
+            # [perf upload] Vectorized mask via big-int XOR instead of a per-byte
+            # Python loop. The old loop ran one Python iteration per payload byte
+            # while holding the GIL on EVERY uploaded frame (~64K-256K iters/frame),
+            # which was the dominant cause of UI jank during file sends.
+            # int.from_bytes/to_bytes do the XOR in C. `full` tiles the 4-byte key
+            # to payload length so full[i] == mask_key[i & 3] (identical result).
+            full = (mask_key * (length // 4 + 1))[:length]
+            out.extend(
+                (int.from_bytes(body, "big") ^ int.from_bytes(full, "big")).to_bytes(length, "big")
+            )
+    else:
+        out.extend(body)
+    return bytes(out)
+def _tgws_read_exact(reader, size):
+    buf = b""
+    need = int(size or 0)
+    while len(buf) < need:
+        chunk = reader.read(need - len(buf))
+        if not chunk:
+            raise EOFError("unexpected eof")
+        buf += chunk
+    return buf
+def _tgws_recv_exact(conn, size):
+    data = b""
+    need = int(size or 0)
+    while len(data) < need:
+        chunk = conn.recv(need - len(data))
+        if not chunk:
+            raise EOFError("unexpected eof")
+        data += chunk
+    return data
+_TGWS_DNS_CACHE = {}
+_TGWS_DNS_CACHE_LOCK = threading.Lock()
+_TGWS_DNS_TTL_SEC = 60.0
+# Hard cap on distinct hostnames cached. Entries are never proactively
+# deleted (expired ones are only overwritten on re-resolve), so without a
+# cap the CF-proxy domain pool — refreshed from a remote list hourly —
+# would grow this dict without bound over a multi-day session.
+_TGWS_DNS_CACHE_MAX = 256
+def _tgws_resolve_ipv4(hostname):
+    try:
+        hn = str(hostname or "").strip()
+        if not hn:
+            return None
+        try:
+            if ":" in hn:
+                return None
+            socket.inet_aton(hn)
+            return hn
+        except Exception:
+            pass
+        # Cache hit?
+        try:
+            with _TGWS_DNS_CACHE_LOCK:
+                cached = _TGWS_DNS_CACHE.get(hn)
+            if cached is not None:
+                ip, ts = cached
+                if (time.time() - float(ts)) < _TGWS_DNS_TTL_SEC:
+                    return ip
+        except Exception:
+            pass
+        for family, _, _, _, sockaddr in socket.getaddrinfo(hn, None, socket.AF_INET, socket.SOCK_STREAM):
+            if family == socket.AF_INET:
+                ip = str(sockaddr[0])
+                try:
+                    with _TGWS_DNS_CACHE_LOCK:
+                        if hn not in _TGWS_DNS_CACHE and len(_TGWS_DNS_CACHE) >= _TGWS_DNS_CACHE_MAX:
+                            _now = time.time()
+                            # Drop expired entries first.
+                            for _k in [
+                                _hk for _hk, _hv in list(_TGWS_DNS_CACHE.items())
+                                if (_now - float(_hv[1])) >= _TGWS_DNS_TTL_SEC
+                            ]:
+                                _TGWS_DNS_CACHE.pop(_k, None)
+                            # Still full -> evict the single oldest entry.
+                            if len(_TGWS_DNS_CACHE) >= _TGWS_DNS_CACHE_MAX:
+                                _oldest = min(_TGWS_DNS_CACHE.items(), key=lambda kv: kv[1][1])[0]
+                                _TGWS_DNS_CACHE.pop(_oldest, None)
+                        _TGWS_DNS_CACHE[hn] = (ip, time.time())
+                except Exception:
+                    pass
+                return ip
+    except Exception:
+        return None
+    return None
+TGWS_HANDSHAKE_LEN = 64
+TGWS_SKIP_LEN = 8
+TGWS_PREKEY_LEN = 32
+TGWS_IV_LEN = 16
+TGWS_PROTO_TAG_POS = 56
+TGWS_DC_IDX_POS = 60
+TGWS_ZERO_64 = b"\x00" * 64
+TGWS_PROTO_TAG_ABRIDGED = b"\xef\xef\xef\xef"
+TGWS_PROTO_TAG_INTERMEDIATE = b"\xee\xee\xee\xee"
+TGWS_PROTO_TAG_SECURE = b"\xdd\xdd\xdd\xdd"
+TGWS_RESERVED_FIRST_BYTES = {0xEF}
+TGWS_RESERVED_STARTS = {
+    b"HEAD", b"POST", b"GET ", b"\xee\xee\xee\xee", b"\xdd\xdd\xdd\xdd", b"\x16\x03\x01\x02"
+}
+TGWS_DIRECT_DC_IP = {
+    1: "149.154.175.50",
+    2: "149.154.167.51",
+    3: "149.154.175.100",
+    4: "149.154.167.91",
+    5: "149.154.171.5",
+    203: "91.105.192.100",
+}
+def _tgws_to_bytes(value):
+    if value is None:
+        return b""
+    try:
+        return bytes(value)
+    except Exception:
+        try:
+            return bytes(bytearray(value))
+        except Exception:
+            return b""
+def _tgws_cipher_new(key_bytes, iv_bytes):
+    if JavaCipher is None or SecretKeySpec is None or IvParameterSpec is None:
+        raise RuntimeError("Java crypto unavailable")
+    cipher = JavaCipher.getInstance("AES/CTR/NoPadding")
+    cipher.init(JavaCipher.ENCRYPT_MODE, SecretKeySpec(bytes(key_bytes), "AES"), IvParameterSpec(bytes(iv_bytes)))
+    return cipher
+def _tgws_cipher_update(cipher, data):
+    try:
+        if not data:
+            return b""
+        # [perf upload] bytes(x) on an already-bytes object allocates a fresh
+        # full copy. This runs twice per upload chunk (clt_dec + tg_enc); skip the
+        # copy when data is already bytes. Chaquopy passes a Python bytes straight
+        # to the Java byte[] argument, so no explicit conversion is needed.
+        if type(data) is not bytes:
+            data = bytes(data)
+        out = cipher.update(data)
+        return _tgws_to_bytes(out)
+    except Exception:
+        return b""
+def _tgws_try_mtproto_handshake(handshake, secret_bytes):
+    try:
+        raw = bytes(handshake or b"")
+        secret = bytes(secret_bytes or b"")
+        if len(raw) < TGWS_HANDSHAKE_LEN or len(secret) != 16:
+            return None
+        dec_prekey_iv = raw[TGWS_SKIP_LEN:TGWS_SKIP_LEN + TGWS_PREKEY_LEN + TGWS_IV_LEN]
+        dec_prekey = dec_prekey_iv[:TGWS_PREKEY_LEN]
+        dec_iv = dec_prekey_iv[TGWS_PREKEY_LEN:]
+        dec_key = hashlib.sha256(dec_prekey + secret).digest()
+        dec = _tgws_cipher_new(dec_key, dec_iv)
+        decrypted = _tgws_cipher_update(dec, raw[:TGWS_HANDSHAKE_LEN])
+        if len(decrypted) < TGWS_HANDSHAKE_LEN:
+            return None
+        proto_tag = decrypted[TGWS_PROTO_TAG_POS:TGWS_PROTO_TAG_POS + 4]
+        if proto_tag not in (TGWS_PROTO_TAG_ABRIDGED, TGWS_PROTO_TAG_INTERMEDIATE, TGWS_PROTO_TAG_SECURE):
+            return None
+        dc_idx = struct.unpack("<h", decrypted[TGWS_DC_IDX_POS:TGWS_DC_IDX_POS + 2])[0]
+        dc_id = abs(int(dc_idx))
+        if dc_id <= 0 or dc_id > 1000:
+            return None
+        proto_int = struct.unpack("<I", proto_tag)[0]
+        return dc_id, bool(dc_idx < 0), int(proto_int), bytes(proto_tag), bytes(dec_prekey_iv)
+    except Exception:
+        return None
+def _tgws_generate_relay_init(proto_tag, dc_idx):
+    try:
+        proto = bytes(proto_tag or b"")[:4]
+        if len(proto) != 4:
+            proto = TGWS_PROTO_TAG_ABRIDGED
+        while True:
+            rnd = bytearray(os.urandom(TGWS_HANDSHAKE_LEN))
+            if rnd[0] in TGWS_RESERVED_FIRST_BYTES:
+                continue
+            if bytes(rnd[:4]) in TGWS_RESERVED_STARTS:
+                continue
+            if rnd[4:8] == b"\x00\x00\x00\x00":
+                continue
+            break
+        rnd_bytes = bytes(rnd)
+        enc_key = rnd_bytes[TGWS_SKIP_LEN:TGWS_SKIP_LEN + TGWS_PREKEY_LEN]
+        enc_iv = rnd_bytes[TGWS_SKIP_LEN + TGWS_PREKEY_LEN:TGWS_SKIP_LEN + TGWS_PREKEY_LEN + TGWS_IV_LEN]
+        enc = _tgws_cipher_new(enc_key, enc_iv)
+        encrypted_full = _tgws_cipher_update(enc, rnd_bytes)
+        if len(encrypted_full) < TGWS_HANDSHAKE_LEN:
+            return rnd_bytes
+        keystream_tail = bytes(encrypted_full[i] ^ rnd_bytes[i] for i in range(56, 64))
+        tail_plain = proto + struct.pack("<h", int(dc_idx)) + os.urandom(2)
+        encrypted_tail = bytes(tail_plain[i] ^ keystream_tail[i] for i in range(8))
+        result = bytearray(rnd_bytes)
+        result[56:64] = encrypted_tail
+        return bytes(result)
+    except Exception:
+        return os.urandom(TGWS_HANDSHAKE_LEN)
+class _TgWsCryptoCtx:
+    def __init__(self, clt_dec, clt_enc, tg_enc, tg_dec):
+        self.clt_dec = clt_dec
+        self.clt_enc = clt_enc
+        self.tg_enc = tg_enc
+        self.tg_dec = tg_dec
+def _tgws_build_crypto_ctx(client_dec_prekey_iv, secret_bytes, relay_init):
+    secret = bytes(secret_bytes or b"")
+    client_iv = bytes(client_dec_prekey_iv or b"")
+    relay = bytes(relay_init or b"")
+    clt_dec_prekey = client_iv[:TGWS_PREKEY_LEN]
+    clt_dec_iv = client_iv[TGWS_PREKEY_LEN:TGWS_PREKEY_LEN + TGWS_IV_LEN]
+    clt_dec_key = hashlib.sha256(clt_dec_prekey + secret).digest()
+    clt_dec = _tgws_cipher_new(clt_dec_key, clt_dec_iv)
+    _tgws_cipher_update(clt_dec, TGWS_ZERO_64)
+    clt_enc_prekey_iv = client_iv[::-1]
+    clt_enc_key = hashlib.sha256(clt_enc_prekey_iv[:TGWS_PREKEY_LEN] + secret).digest()
+    clt_enc_iv = clt_enc_prekey_iv[TGWS_PREKEY_LEN:TGWS_PREKEY_LEN + TGWS_IV_LEN]
+    clt_enc = _tgws_cipher_new(clt_enc_key, clt_enc_iv)
+    relay_enc_key = relay[TGWS_SKIP_LEN:TGWS_SKIP_LEN + TGWS_PREKEY_LEN]
+    relay_enc_iv = relay[TGWS_SKIP_LEN + TGWS_PREKEY_LEN:TGWS_SKIP_LEN + TGWS_PREKEY_LEN + TGWS_IV_LEN]
+    tg_enc = _tgws_cipher_new(relay_enc_key, relay_enc_iv)
+    _tgws_cipher_update(tg_enc, TGWS_ZERO_64)
+    relay_dec_prekey_iv = relay[TGWS_SKIP_LEN:TGWS_SKIP_LEN + TGWS_PREKEY_LEN + TGWS_IV_LEN][::-1]
+    relay_dec_key = relay_dec_prekey_iv[:TGWS_PREKEY_LEN]
+    relay_dec_iv = relay_dec_prekey_iv[TGWS_PREKEY_LEN:TGWS_PREKEY_LEN + TGWS_IV_LEN]
+    tg_dec = _tgws_cipher_new(relay_dec_key, relay_dec_iv)
+    return _TgWsCryptoCtx(clt_dec, clt_enc, tg_enc, tg_dec)
+def _tgws_generate_secret_hex():
+    try:
+        return binascii.hexlify(os.urandom(16)).decode("ascii")
+    except Exception:
+        return "%032x" % random.getrandbits(128)
+def _tgws_valid_secret_hex(value):
+    try:
+        s = str(value or "").strip().lower()
+        if s.startswith("dd") or s.startswith("ee"):
+            s = s[2:34]
+        if len(s) != 32:
+            return ""
+        bytes.fromhex(s)
+        return s
+    except Exception:
+        return ""
+class _TgWsMsgSplitter:
+    def __init__(self, init_data, proto_int=None):
+        raw = bytes(init_data or b"")
+        key = raw[8:40]
+        iv = raw[40:56]
+        if JavaCipher is None or SecretKeySpec is None or IvParameterSpec is None:
+            raise RuntimeError("Java crypto unavailable")
+        cipher = JavaCipher.getInstance("AES/CTR/NoPadding")
+        cipher.init(JavaCipher.ENCRYPT_MODE, SecretKeySpec(bytes(key), "AES"), IvParameterSpec(bytes(iv)))
+        try:
+            cipher.update(b"\x00" * 64)
+        except Exception:
+            pass
+        self._cipher = cipher
+        try:
+            self._proto = int(proto_int or 0)
+        except Exception:
+            self._proto = 0
+        self._cipher_buf = bytearray()
+        self._plain_buf = bytearray()
+        self._disabled = False
+        # Hard cap: a corrupted/foreign length prefix can declare a multi-GB
+        # packet, making _next_packet_len() return None forever while the
+        # buffers grow with every chunk. Past this size with no frame
+        # boundary we give up splitting and pass through (see split()).
+        self._max_buf = 16 * 1024 * 1024
+    def split(self, chunk):
+        if not chunk:
+            return []
+        if self._disabled:
+            return [chunk]
+        try:
+            self._cipher_buf.extend(bytes(chunk))
+            plain = self._cipher.update(bytes(chunk))
+            try:
+                self._plain_buf.extend(bytes(plain))
+            except Exception:
+                self._plain_buf.extend(bytes(bytearray(plain)))
+        except Exception:
+            return [chunk]
+        parts = []
+        while self._cipher_buf:
+            packet_len = self._next_packet_len()
+            if packet_len is None:
+                if len(self._cipher_buf) > self._max_buf:
+                    # No frame boundary within the cap -> stop splitting and
+                    # flush what we have as one passthrough chunk so the
+                    # buffers can never grow without bound on a broken stream.
+                    parts.append(bytes(self._cipher_buf))
+                    self._cipher_buf.clear()
+                    self._plain_buf.clear()
+                    self._disabled = True
+                break
+            if packet_len <= 0:
+                parts.append(bytes(self._cipher_buf))
+                self._cipher_buf.clear()
+                self._plain_buf.clear()
+                self._disabled = True
+                break
+            parts.append(bytes(self._cipher_buf[:packet_len]))
+            del self._cipher_buf[:packet_len]
+            del self._plain_buf[:packet_len]
+        return parts
+    def flush(self):
+        if not self._cipher_buf:
+            return []
+        tail = bytes(self._cipher_buf)
+        self._cipher_buf.clear()
+        self._plain_buf.clear()
+        return [tail]
+    def _next_packet_len(self):
+        try:
+            proto = int(self._proto)
+        except Exception:
+            proto = 0
+        if not self._plain_buf:
+            return None
+        if proto == 0xEFEFEFEF:
+            return self._next_abridged_len()
+        if proto in (0xEEEEEEEE, 0xDDDDDDDD):
+            return self._next_intermediate_len()
+        return 0
+    def _next_abridged_len(self):
+        first = self._plain_buf[0]
+        if first in (0x7F, 0xFF):
+            if len(self._plain_buf) < 4:
+                return None
+            payload_len = int.from_bytes(self._plain_buf[1:4], "little") * 4
+            header_len = 4
+        else:
+            payload_len = (first & 0x7F) * 4
+            header_len = 1
+        if payload_len <= 0:
+            return 0
+        packet_len = header_len + payload_len
+        if len(self._plain_buf) < packet_len:
+            return None
+        return packet_len
+    def _next_intermediate_len(self):
+        if len(self._plain_buf) < 4:
+            return None
+        payload_len = struct.unpack_from("<I", self._plain_buf, 0)[0] & 0x7FFFFFFF
+        if payload_len <= 0:
+            return 0
+        packet_len = 4 + payload_len
+        if len(self._plain_buf) < packet_len:
+            return None
+        return packet_len
+def _tgws_ws_domains(dc, is_media):
+    try:
+        dc_num = int(dc or 0)
+    except (TypeError, ValueError):
+        dc_num = 0
+    try:
+        dc_num = int(TGWS_DC_OVERRIDES.get(int(dc_num), int(dc_num)))
+    except Exception:
+        pass
+    bases = ["web.telegram.org"]
+    out = []
+    for base in bases:
+        if is_media:
+            out.append(f"kws{dc_num}-1.{base}")
+            out.append(f"kws{dc_num}.{base}")
+        else:
+            out.append(f"kws{dc_num}.{base}")
+            out.append(f"kws{dc_num}-1.{base}")
+    seen = set()
+    uniq = []
+    for d in out:
+        if d not in seen:
+            seen.add(d)
+            uniq.append(d)
+    return uniq
+class _TgWsRawWebSocket:
+    def __init__(self, sock, reader):
+        self.sock = sock
+        self.reader = reader
+        self._lock = threading.Lock()
+        self._closed = False
+        self._last_io_ts = time.time()
+        # [v2.4.3 keepalive] monotonic ts of the last pong (0xA) seen from the server,
+        # used by the bridge to confirm a quiet tunnel is still alive before holding it.
+        self._last_pong_ts = 0.0
+    def ping(self, payload=b""):
+        """Send a WS ping frame. Returns True if sent OK, False if the socket is dead."""
+        try:
+            with self._lock:
+                if self._closed:
+                    return False
+                self.sock.sendall(_tgws_build_frame(0x9, bytes(payload or b""), mask=True))
+                self._last_io_ts = time.time()
+            return True
+        except Exception:
+            try:
+                self.close()
+            except Exception:
+                pass
+            return False
+    def last_io_age(self):
+        try:
+            return float(time.time() - float(self._last_io_ts or 0.0))
+        except Exception:
+            return 0.0
+    @staticmethod
+    def _open_socket(connect_host, timeout):
+        sock = socket.create_connection((str(connect_host), 443), timeout=float(timeout))
+        try:
+            if TGWS_TCP_NODELAY:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except:
+            pass
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(TGWS_SOCK_RCVBUF))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(TGWS_SOCK_SNDBUF))
+        except Exception:
+            pass
+        # RES-04: TCP keepalive ONLY on the upstream WS socket (never on the local
+        # TG->127.0.0.1 client side). Conservative idle (5 min) so we don't keep the
+        # mobile radio awake / drain battery, then 3 probes 60s apart to detect a
+        # silently dropped link.
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, int(TGWS_TCP_KEEPIDLE_SEC))
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, int(TGWS_TCP_KEEPINTVL_SEC))
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, int(TGWS_TCP_KEEPCNT))
+        except Exception:
+            pass
+        return sock
+    @staticmethod
+    def connect(connect_host, sni_host, timeout=TGWS_WS_CONNECT_TIMEOUT_SEC):
+        sni = str(sni_host or "")
+        # TLS policy: attempt a fully verified handshake first (real protection
+        # against man-in-the-middle on every network that allows it — the common
+        # case). Only if the cert fails to verify because the network is actively
+        # intercepting TLS — precisely the censored environments this tunnel exists
+        # to bypass — fall back to an unverified handshake so the link still comes
+        # up. Payload confidentiality never depends on this outer layer: MTProto is
+        # independently end-to-end encrypted inside the WebSocket.
+        sock = _TgWsRawWebSocket._open_socket(connect_host, timeout)
+        wrapped = None
+        try:
+            if ssl is None:
+                wrapped = sock
+            else:
+                try:
+                    vctx = ssl.create_default_context(cafile=_CA_BUNDLE if isinstance(_CA_BUNDLE, str) else None)
+                    vctx.check_hostname = True
+                    vctx.verify_mode = ssl.CERT_REQUIRED
+                    wrapped = vctx.wrap_socket(sock, server_hostname=sni)
+                except getattr(ssl, "SSLCertVerificationError", ssl.SSLError):
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    sock = _TgWsRawWebSocket._open_socket(connect_host, timeout)
+                    rctx = ssl.create_default_context()
+                    rctx.check_hostname = False
+                    rctx.verify_mode = ssl.CERT_NONE
+                    wrapped = rctx.wrap_socket(sock, server_hostname=sni)
+            wrapped.settimeout(float(timeout))
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            req = "\r\n".join([
+                "GET /apiws HTTP/1.1",
+                "Host: " + str(sni_host or ""),
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                "Sec-WebSocket-Key: " + key,
+                "Sec-WebSocket-Version: 13",
+                "Sec-WebSocket-Protocol: binary",
+                "Origin: https://web.telegram.org",
+                "User-Agent: Mozilla/5.0 (Linux; Android 13)",
+                "",
+                "",
+            ])
+            wrapped.sendall(req.encode("utf-8"))
+            reader = wrapped.makefile("rb")
+            status_line = reader.readline().decode("utf-8", errors="ignore").strip()
+            headers = {}
+            try:
+                while True:
+                    line = reader.readline()
+                    if not line:
+                        break
+                    if line in (b"\r\n", b"\n"):
+                        break
+                    try:
+                        s = line.decode("utf-8", errors="ignore").strip()
+                    except:
+                        continue
+                    if ":" in s:
+                        k, v = s.split(":", 1)
+                        headers[str(k).strip().lower()] = str(v).strip()
+            except:
+                headers = headers or {}
+            if " 101 " not in status_line:
+                try:
+                    reader.close()
+                except:
+                    pass
+                try:
+                    wrapped.close()
+                except:
+                    pass
+                try:
+                    parts = str(status_line).split(" ", 2)
+                    code = int(parts[1]) if len(parts) >= 2 else 0
+                except:
+                    code = 0
+                try:
+                    loc = str(headers.get("location", "") or "").strip()
+                except:
+                    loc = ""
+                if code in (301, 302, 303, 307, 308) and loc:
+                    raise RuntimeError(f"{status_line} -> {loc}")
+                raise RuntimeError(status_line or "bad websocket handshake")
+            return _TgWsRawWebSocket(wrapped, reader)
+        except Exception:
+            # [v2.4.2 leak-fix] Close any fd opened here on ANY failure (TLS error,
+            # timeout, RST mid-handshake, non-101) so a failed connect never leaks a
+            # socket — critical under RKN (RSTs mid-handshake) and for the warmup loop
+            # that exercises this path continuously.
+            try:
+                if wrapped is not None and wrapped is not sock:
+                    wrapped.close()
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+            raise
+    def send(self, payload):
+        with self._lock:
+            if self._closed:
+                raise EOFError("websocket closed")
+            self.sock.sendall(_tgws_build_frame(0x2, payload, mask=True))
+    def send_batch(self, parts):
+        with self._lock:
+            if self._closed:
+                raise EOFError("websocket closed")
+            # [perf upload] Build all frames, then issue ONE sendall. The old loop
+            # did a syscall + TLS record per MTProto packet; a 256KB upload chunk
+            # can split into many packets, so coalescing cuts per-packet overhead.
+            frames = [_tgws_build_frame(0x2, payload, mask=True) for payload in list(parts or [])]
+            if frames:
+                self.sock.sendall(b"".join(frames))
+    def _read_frame(self):
+        header = _tgws_read_exact(self.reader, 2)
+        opcode = header[0] & 0x0F
+        masked = bool(header[1] & 0x80)
+        length = header[1] & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", _tgws_read_exact(self.reader, 2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", _tgws_read_exact(self.reader, 8))[0]
+        mask_key = b""
+        if masked:
+            mask_key = _tgws_read_exact(self.reader, 4)
+        payload = _tgws_read_exact(self.reader, length)
+        if masked:
+            payload = _tgws_xor_mask(payload, mask_key)
+        return opcode, payload
+    def recv(self):
+        while True:
+            opcode, payload = self._read_frame()
+            if opcode == 0x8:
+                self.close()
+                return None
+            if opcode == 0x9:
+                self._write_control(0xA, payload)
+                continue
+            if opcode == 0xA:
+                self._last_pong_ts = time.time()
+                continue
+            if opcode in (0x1, 0x2):
+                return payload
+    def _write_control(self, opcode, payload):
+        with self._lock:
+            if self._closed:
+                return
+            self.sock.sendall(_tgws_build_frame(opcode, payload, mask=True))
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self.sock.sendall(_tgws_build_frame(0x8, b"", mask=True))
+            except:
+                pass
+            try:
+                self.reader.close()
+            except:
+                pass
+            try:
+                self.sock.close()
+            except:
+                pass
+    def is_closed(self):
+        try:
+            return bool(self._closed)
+        except Exception:
+            return True
+class _TgWsWsPool:
+    def __init__(self, max_age_sec=120.0, max_items_per_key=2):
+        self._max_age = float(max_age_sec or 120.0)
+        self._max_items = int(max_items_per_key or 2)
+        self._lock = threading.Lock()
+        self._idle = {}
+    def get(self, key):
+        now = time.time()
+        with self._lock:
+            q = self._idle.get(key)
+            if not q:
+                return None
+            while q:
+                ws, ts = q.pop(0)
+                if ws is None:
+                    continue
+                try:
+                    if ws.is_closed():
+                        continue
+                except Exception:
+                    continue
+                if self._max_age and (now - float(ts or 0.0)) > self._max_age:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    continue
+                return ws
+            return None
+    def put(self, key, ws):
+        if ws is None:
+            return
+        try:
+            if ws.is_closed():
+                return
+        except Exception:
+            return
+        with self._lock:
+            q = self._idle.get(key)
+            if not q:
+                q = []
+                self._idle[key] = q
+            if len(q) >= self._max_items:
+                try:
+                    old, _ = q.pop(0)
+                    if old is not None:
+                        old.close()
+                except Exception:
+                    pass
+            q.append((ws, time.time()))
+    def clear(self):
+        with self._lock:
+            all_items = []
+            for q in self._idle.values():
+                all_items.extend(list(q))
+            self._idle = {}
+        for ws, _ in all_items:
+            try:
+                if ws is not None:
+                    ws.close()
+            except Exception:
+                pass
+    def count(self, key):
+        with self._lock:
+            q = self._idle.get(key)
+            return len(q) if q else 0
+    def total(self):
+        with self._lock:
+            return sum(len(q) for q in self._idle.values())
+class TgWsCore:
+    def __init__(self):
+        self.listener = None
+        self.listener_thread = None
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        # RLock guards compound read-modify-write on fail_until/ws_blacklist/
+        # ws_domain_pref/_cf_pref/_cf_domains. RLock so the same handler thread
+        # can re-enter (e.g. _connect_ws_direct calling helpers that also lock).
+        self._cfg_lock = threading.RLock()
+        self.tracked = set()
+        self.fail_until = {}
+        self.fail_count = {}
+        self.ws_blacklist = set()
+        self.ws_blacklist_until = {}
+        self.ws_domain_pref = {}
+        self.port = 0
+        self.dc_ip = dict(TGWS_DEFAULT_DC_IP)
+        self.secret_hex = ""
+        self.secret_bytes = b""
+        self._ws_pool = _TgWsWsPool(max_age_sec=float(TGWS_WS_SPARE_MAX_AGE_SEC), max_items_per_key=int(TGWS_WS_SPARE_PER_KEY))
+        self._cf_domains = []
+        self._cf_pref = {}
+        # [v2.4.2 warmup] (dc, is_media) -> last-seen ts of a real client connection,
+        # so the warmup loop only primes spares for DCs Telegram actually uses.
+        self._active_keys = {}
+        # [v2.3 sticky-lane] dc_key (dc, is_media) -> "cf"|"direct": the lane that
+        # last connected for this DC. Tried first next time so the route stops
+        # hopping. TCP is never recorded here (always-last fallback). _route_version
+        # is bumped on any pref mutation so the plugin can persist lazily.
+        self.lane_pref = {}
+        self._route_version = 0
+        try:
+            _tgws_start_cfproxy_domain_refresh(self._set_cf_domains)
+        except Exception:
+            pass
+    def _set_cf_domains(self, domains):
+        try:
+            d = list(domains or [])
+        except Exception:
+            d = []
+        seen = set()
+        out = []
+        for x in d:
+            try:
+                s = str(x or "").strip().lower()
+            except Exception:
+                continue
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        try:
+            with self._cfg_lock:
+                self._cf_domains = out
+        except Exception:
+            self._cf_domains = out
+    def _cf_domains_for_dc(self, dc, is_media=False):
+        try:
+            dc_num = int(dc or 0)
+        except Exception:
+            dc_num = 0
+        # Snapshot pool and pref together under lock so a refresh in-between
+        # cannot produce mismatched (pool, pref) pair.
+        try:
+            with self._cfg_lock:
+                pool = list(getattr(self, "_cf_domains", []) or [])
+                _pref_map = dict(getattr(self, "_cf_pref", {}) or {})
+        except Exception:
+            pool = list(getattr(self, "_cf_domains", []) or [])
+            _pref_map = dict(getattr(self, "_cf_pref", {}) or {})
+        if not pool:
+            return []
+        try:
+            pref = str(_pref_map.get(int(dc_num), "") or "").strip().lower()
+        except Exception:
+            pref = ""
+        ordered = []
+        if pref and pref in pool:
+            ordered.append(pref)
+        for base in pool:
+            if base != pref:
+                ordered.append(base)
+        out = []
+        for base in ordered:
+            if is_media:
+                out.append(f"kws{dc_num}-1.{base}")
+            out.append(f"kws{dc_num}.{base}")
+        seen = set()
+        uniq = []
+        for d in out:
+            if d not in seen:
+                seen.add(d)
+                uniq.append(d)
+        return uniq
+    def _ws_pool_key(self, dc, is_media):
+        try:
+            return (int(dc or 0), bool(is_media))
+        except Exception:
+            return (0, bool(is_media))
+    def _ws_pool_get(self, dc, is_media):
+        return self._ws_pool.get(self._ws_pool_key(dc, is_media))
+    def _ws_pool_put(self, dc, is_media, ws):
+        try:
+            self._ws_pool.put(self._ws_pool_key(dc, is_media), ws)
+        except Exception:
+            try:
+                if ws is not None:
+                    ws.close()
+            except Exception:
+                pass
+    def _ws_pool_count(self, dc, is_media):
+        try:
+            return int(self._ws_pool.count(self._ws_pool_key(dc, is_media)))
+        except Exception:
+            return 0
+    def _ws_pool_total(self):
+        try:
+            return int(self._ws_pool.total())
+        except Exception:
+            return 0
+    def _note_active_key(self, dc, is_media):
+        # Record that Telegram actually uses this (dc, is_media) so the warmup loop
+        # primes spares only for live DCs (bounded set).
+        try:
+            with self._cfg_lock:
+                self._active_keys[self._ws_pool_key(dc, is_media)] = time.time()
+                if len(self._active_keys) > 32:
+                    # prune oldest if it ever grows unexpectedly
+                    cutoff = time.time() - float(TGWS_WS_ACTIVE_KEY_TTL_SEC)
+                    self._active_keys = {k: t for k, t in self._active_keys.items() if t >= cutoff}
+        except Exception:
+            pass
+    def _ws_fail_timeout(self, dc_key):
+        # RES-05b: read fail_until under _cfg_lock; use the short connect timeout
+        # while a DC is still inside its backoff cooldown window.
+        try:
+            with self._cfg_lock:
+                fail_until = float(self.fail_until.get(dc_key, 0.0) or 0.0)
+        except Exception:
+            fail_until = 0.0
+        try:
+            if time.time() < fail_until:
+                return float(TGWS_WS_FAIL_TIMEOUT_SEC)
+        except Exception:
+            pass
+        return float(TGWS_WS_CONNECT_TIMEOUT_SEC)
+    def _ws_fail_record(self, dc_key):
+        # RES-05b: read fail_count under _cfg_lock, compute exponential backoff
+        # OUTSIDE the lock, then write fail_count + fail_until back under the lock as
+        # one atomic transaction (no torn read-modify-write between handler threads).
+        try:
+            with self._cfg_lock:
+                prev = int(self.fail_count.get(dc_key, 0) or 0)
+        except Exception:
+            prev = 0
+        new_count = prev + 1
+        try:
+            base = float(TGWS_WS_FAIL_COOLDOWN_SEC)
+            backoff = base * (2 ** min(max(new_count - 1, 0), 4))
+            backoff = min(backoff, float(TGWS_WS_FAIL_COOLDOWN_MAX_SEC))
+        except Exception:
+            backoff = float(TGWS_WS_FAIL_COOLDOWN_SEC)
+        deadline = time.time() + backoff
+        try:
+            with self._cfg_lock:
+                self.fail_count[dc_key] = int(new_count)
+                self.fail_until[dc_key] = float(deadline)
+        except Exception:
+            pass
+    def _ws_fail_clear(self, dc_key):
+        # RES-05b: clear backoff state on a successful connect (atomic under lock).
+        try:
+            with self._cfg_lock:
+                self.fail_until.pop(dc_key, None)
+                self.fail_count.pop(dc_key, None)
+        except Exception:
+            pass
+    def _ws_is_blacklisted(self, dc_key):
+        # RES-06/06b: TTL blacklist check under _cfg_lock (short critical section).
+        # Lazily auto-clears an entry once its TTL has elapsed so the DC is retried.
+        now = time.time()
+        try:
+            with self._cfg_lock:
+                until = self.ws_blacklist_until.get(dc_key)
+                if until is None:
+                    return False
+                if now >= float(until or 0.0):
+                    self.ws_blacklist_until.pop(dc_key, None)
+                    try:
+                        self.ws_blacklist.discard(dc_key)
+                    except Exception:
+                        pass
+                    return False
+                return True
+        except Exception:
+            return False
+    def _ws_blacklist_add(self, dc_key):
+        # RES-06/06b: blacklist a DC for a bounded TTL (auto-expires) under _cfg_lock.
+        try:
+            with self._cfg_lock:
+                self.ws_blacklist_until[dc_key] = time.time() + float(TGWS_WS_BLACKLIST_TTL_SEC)
+                try:
+                    self.ws_blacklist.add(dc_key)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    def _bump_route_version(self):
+        # Caller MUST hold self._cfg_lock. Marks the sticky-route memory dirty so
+        # the plugin's lazy persister knows there is something new to save.
+        try:
+            self._route_version = int(getattr(self, "_route_version", 0)) + 1
+        except Exception:
+            self._route_version = 1
+    def route_version(self):
+        try:
+            return int(getattr(self, "_route_version", 0))
+        except Exception:
+            return 0
+    def _lane_fail_key(self, dc_key, lane):
+        # Namespaced key into fail_until/fail_count/ws_blacklist so each lane keeps
+        # its OWN backoff. direct keeps the bare dc_key (back-compat with the
+        # existing _connect_ws_direct redirect-blacklist that also uses dc_key);
+        # cf gets a ("cf", ...) prefix so it finally gets the same backoff treatment.
+        try:
+            return ("cf", dc_key) if lane == "cf" else dc_key
+        except Exception:
+            return dc_key
+    def _ordered_lanes(self, dc_key):
+        # [CF-first-hard] ALWAYS try CF (Cloudflare-fronted, anti-DPI) first on EVERY
+        # connection; direct (kwsN.web.telegram.org, the native Telegram WS that RKN
+        # actively throttles/RSTs) is only the fallback. This matches TG-WS, which
+        # holds. The previous sticky lane_pref promoted 'direct' to first place after
+        # CF momentarily failed twice; direct then dominated (~94/107 in telemetry),
+        # its connections got cut, and Telegram stormed reconnects (the "infinite
+        # connecting" bug). CF-first-hard gives the un-throttled CF lane a fresh first
+        # attempt every time, so traffic structurally rides CF and connections hold.
+        # TCP stays the always-last fallback handled by _handle_client.
+        return ["cf", "direct"]
+    def _lane_record_success(self, dc_key, lane):
+        # Promote `lane` to sticky for this DC. To avoid CF<->direct ping-pong, only
+        # flip away from the current sticky lane once it has either racked up
+        # TGWS_LANE_HYSTERESIS consecutive failures or is currently blacklisted.
+        if lane not in ("cf", "direct"):
+            return
+        try:
+            with self._cfg_lock:
+                cur = str(self.lane_pref.get(dc_key) or "").strip().lower()
+                if cur == lane:
+                    return
+                if cur in ("cf", "direct"):
+                    cur_key = self._lane_fail_key(dc_key, cur)
+                    if not self._ws_is_blacklisted(cur_key):
+                        fails = int(self.fail_count.get(cur_key, 0) or 0)
+                        if fails < int(TGWS_LANE_HYSTERESIS):
+                            return
+                self.lane_pref[dc_key] = lane
+                self._bump_route_version()
+        except Exception:
+            pass
+    def export_route_pref(self):
+        # Snapshot sticky-route memory as a JSON-serializable dict. tuple dc_keys
+        # (dc, is_media) are encoded "dc:0|1"; _cf_pref keys are plain ints.
+        try:
+            with self._cfg_lock:
+                lane = {f"{int(k[0])}:{int(bool(k[1]))}": str(v)
+                        for k, v in self.lane_pref.items() if v in ("cf", "direct")}
+                dom = {f"{int(k[0])}:{int(bool(k[1]))}": str(v)
+                       for k, v in self.ws_domain_pref.items() if v}
+                cf = {str(int(k)): str(v) for k, v in self._cf_pref.items() if v}
+            return {"lane": lane, "dom": dom, "cf": cf}
+        except Exception:
+            return None
+    def import_route_pref(self, data):
+        # Load a previously exported snapshot. Stale entries degrade gracefully:
+        # _cf_domains_for_dc only honors a cf base still present in the live pool,
+        # and ws_domain_pref merely reorders the static kws list. Does NOT bump
+        # _route_version, so freshly-loaded data is not immediately re-saved.
+        def _kk(s):
+            a, b = str(s).split(":", 1)
+            return (int(a), bool(int(b)))
+        _CAP = 64  # bound a corrupt/hand-edited route_pref; normal use is ~12 entries
+        try:
+            d = data if isinstance(data, dict) else {}
+            new_lane, new_dom, new_cf = {}, {}, {}
+            # Per-key guards: one malformed key drops only that entry, never the
+            # whole snapshot (which would silently wipe all learned routes).
+            for k, v in (d.get("lane") or {}).items():
+                if len(new_lane) >= _CAP:
+                    break
+                try:
+                    if str(v) in ("cf", "direct"):
+                        new_lane[_kk(k)] = str(v)
+                except Exception:
+                    continue
+            for k, v in (d.get("dom") or {}).items():
+                if len(new_dom) >= _CAP:
+                    break
+                try:
+                    if v:
+                        new_dom[_kk(k)] = str(v)
+                except Exception:
+                    continue
+            for k, v in (d.get("cf") or {}).items():
+                if len(new_cf) >= _CAP:
+                    break
+                try:
+                    if v:
+                        new_cf[int(k)] = str(v)
+                except Exception:
+                    continue
+            with self._cfg_lock:
+                if new_lane:
+                    self.lane_pref.update(new_lane)
+                if new_dom:
+                    self.ws_domain_pref.update(new_dom)
+                if new_cf:
+                    self._cf_pref.update(new_cf)
+        except Exception:
+            pass
+    def reset_resilience_state(self):
+        # RES-06c: on app RESUME (network may have changed) reset blacklist + fail
+        # backoff so DCs that failed pre-sleep are retried at once. Do NOT clear the
+        # WS pool — the keeper-thread evicts stale sockets, and dropping live pooled
+        # connections would add reconnect latency to the first post-resume request.
+        try:
+            with self._cfg_lock:
+                self.ws_blacklist = set()
+                self.ws_blacklist_until = {}
+                self.fail_until = {}
+                self.fail_count = {}
+        except Exception:
+            try:
+                self.ws_blacklist = set()
+                self.ws_blacklist_until = {}
+                self.fail_until = {}
+                self.fail_count = {}
+            except Exception:
+                pass
+    def _warm_one_spare(self, dc, is_media):
+        # Connect ONE fresh CF WS and stash it as a warm spare. Bounded: tries only
+        # the first few CF domains (preferred first), single attempt each, so a fully
+        # RKN-blocked CF pool can never make a warm tick run for minutes. Does NOT
+        # touch _cf_pref (warming must not steer real routing). connect() closes its
+        # socket on every failure path (fixed below), so a failed warm never leaks fd.
+        try:
+            domains = self._cf_domains_for_dc(dc, is_media)
+        except Exception:
+            domains = []
+        tried = 0
+        for domain in domains:
+            if self.stop_event.is_set():
+                return False
+            if tried >= int(TGWS_WS_WARM_DOMAINS_TRY):
+                break
+            tried += 1
+            try:
+                ws = _TgWsRawWebSocket.connect(domain, domain, timeout=float(TGWS_WS_CONNECT_TIMEOUT_SEC))
+                self._ws_pool_put(dc, is_media, ws)
+                return True
+            except Exception:
+                continue
+        return False
+    def _warmup_ws_pool(self, delay_sec=0):
+        # [v2.4.2 warmup] Continuous top-up loop: keep TGWS_WS_SPARE_PER_KEY warm CF
+        # spares ready per recently-active (dc,is_media), capped at TGWS_WS_SPARE_MAX
+        # total. A reconnect then grabs a warm socket (see _connect_ws_cf) and skips
+        # the TLS+WS handshake -> lower proxy ping + the frequent RKN-forced reconnects
+        # become near-instant. Spares are short-lived (TGWS_WS_SPARE_MAX_AGE_SEC) so a
+        # silently-throttled spare ages out instead of being handed to a client.
+        try:
+            d = float(delay_sec or 0)
+        except Exception:
+            d = 0.0
+        try:
+            if d > 0:
+                end = time.time() + d
+                while time.time() < end:
+                    if self.stop_event.is_set():
+                        return
+                    time.sleep(min(0.2, max(0.0, end - time.time())))
+        except Exception:
+            pass
+        while not self.stop_event.is_set():
+            try:
+                now = time.time()
+                ttl = float(TGWS_WS_ACTIVE_KEY_TTL_SEC)
+                with self._cfg_lock:
+                    keys = [k for k, t in self._active_keys.items() if (now - float(t or 0)) <= ttl]
+                # Cold start (no real connection yet): seed the configured DCs so a
+                # spare is ready for the very first connect. Once real DCs are known,
+                # warm ONLY those (don't waste spares/fd on DCs Telegram never uses).
+                if not keys:
+                    for k in list((self.dc_ip or {}).keys()):
+                        try:
+                            dcn = int(k)
+                        except Exception:
+                            continue
+                        keys.append((dcn, False))
+                        keys.append((dcn, True))
+                for (dc, is_media) in keys:
+                    if self.stop_event.is_set():
+                        return
+                    if self._ws_pool_total() >= int(TGWS_WS_SPARE_MAX):
+                        break
+                    if self._ws_pool_count(dc, is_media) >= int(TGWS_WS_SPARE_PER_KEY):
+                        continue
+                    self._warm_one_spare(dc, is_media)
+                    try:
+                        if self.stop_event.wait(max(0.0, float(TGWS_WARMUP_STAGGER_SEC))):
+                            return
+                    except Exception:
+                        return
+            except Exception:
+                pass
+            try:
+                if self.stop_event.wait(max(0.5, float(TGWS_WS_WARM_INTERVAL_SEC))):
+                    return
+            except Exception:
+                return
+    def is_available(self):
+        return JavaCipher is not None
+    def _track(self, closer):
+        with self.lock:
+            self.tracked.add(closer)
+    def _untrack(self, closer):
+        with self.lock:
+            self.tracked.discard(closer)
+    def _close_all_tracked(self):
+        with self.lock:
+            closers = list(self.tracked)
+            self.tracked.clear()
+        for closer in closers:
+            try:
+                closer.close()
+            except Exception:
+                pass
+    def _parse_config(self, config_json):
+        cfg = {"port": int(TGWS_LOCAL_PORT), "dc_ip": dict(TGWS_DEFAULT_DC_IP)}
+        raw = str(config_json or "").strip()
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                if parsed.get("port"):
+                    cfg["port"] = int(parsed.get("port") or TGWS_LOCAL_PORT)
+                dc_ip = parsed.get("dc_ip")
+                if isinstance(dc_ip, dict):
+                    for key, value in dc_ip.items():
+                        cfg["dc_ip"][str(key)] = str(value)
+        if cfg["port"] <= 0 or cfg["port"] > 65535:
+            cfg["port"] = int(TGWS_LOCAL_PORT)
+        return cfg
+    def start(self, config_json, socks_user="", socks_pass="", secret_hex=""):
+        if not self.is_available():
+            return Z("java_crypto_missing")
+        try:
+            cfg = self._parse_config(config_json)
+            secret = _tgws_valid_secret_hex(secret_hex) or _tgws_generate_secret_hex()
+            self.stop()
+            self.secret_hex = secret
+            self.secret_bytes = bytes.fromhex(secret)
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                if TGWS_TCP_NODELAY:
+                    listener.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+            try:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(TGWS_SOCK_RCVBUF))
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(TGWS_SOCK_SNDBUF))
+            except Exception:
+                pass
+            listener.bind((LOCAL_PROXY_HOST, int(cfg["port"])))
+            listener.listen(64)
+            listener.settimeout(1.0)
+            self.listener = listener
+            self.port = int(cfg["port"])
+            self.dc_ip = dict(cfg.get("dc_ip") or {})
+            try:
+                with self._cfg_lock:
+                    self.fail_until = {}
+                    self.fail_count = {}
+                    self.ws_blacklist = set()
+                    self.ws_blacklist_until = {}
+            except Exception:
+                self.fail_until = {}
+                self.fail_count = {}
+                self.ws_blacklist = set()
+                self.ws_blacklist_until = {}
+            self.stop_event.clear()
+            self.listener_thread = threading.Thread(target=self._accept_loop, name="tgws-accept", daemon=True)
+            self.listener_thread.start()
+            if bool(TGWS_WARMUP_ON_START):
+                threading.Thread(target=self._warmup_ws_pool, kwargs={"delay_sec": float(TGWS_WARMUP_DELAY_SEC)}, name="tgws-warmup", daemon=True).start()
+            return ""
+        except Exception as exc:
+            try:
+                if self.listener is not None:
+                    self.listener.close()
+            except Exception:
+                pass
+            self.listener = None
+            return str(exc)
+    def stop(self):
+        self.stop_event.set()
+        try:
+            if self.listener is not None:
+                self.listener.close()
+        except Exception:
+            pass
+        self.listener = None
+        try:
+            self._ws_pool.clear()
+        except Exception:
+            pass
+        self._close_all_tracked()
+        thread = self.listener_thread
+        self.listener_thread = None
+        if thread is not None and thread.is_alive():
+            try:
+                thread.join(1.5)
+            except Exception:
+                pass
+    def _accept_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                conn, _ = self.listener.accept()
+                try:
+                    if TGWS_TCP_NODELAY:
+                        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except Exception:
+                    pass
+                try:
+                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(TGWS_SOCK_RCVBUF))
+                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(TGWS_SOCK_SNDBUF))
+                except Exception:
+                    pass
+            except socket.timeout:
+                continue
+            except Exception:
+                if self.stop_event.is_set():
+                    break
+                continue
+            try:
+                self._track(conn)
+                threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    self._untrack(conn)
+                except Exception:
+                    pass
+                if self.stop_event.is_set():
+                    break
+                continue
+    def _close_write(self, conn):
+        try:
+            conn.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+    def _connect_ws_direct(self, dc, is_media, target_ip, timeout):
+        dc_key = self._ws_pool_key(dc, is_media)
+        try:
+            ws = self._ws_pool_get(dc, is_media)
+            if ws is not None:
+                return ws
+        except Exception:
+            pass
+        domains = _tgws_ws_domains(dc, is_media)
+        try:
+            with self._cfg_lock:
+                pref = str(self.ws_domain_pref.get(dc_key) or "").strip()
+        except Exception:
+            pref = ""
+        if pref:
+            domains = [pref] + [d for d in domains if d != pref]
+        last_exc = None
+        redirects = 0
+        for domain in domains:
+            candidates = []
+            for c in (domain, _tgws_resolve_ipv4(domain), str(target_ip or "").strip()):
+                if c and c not in candidates:
+                    candidates.append(c)
+            for host in candidates:
+                try:
+                    ws = _TgWsRawWebSocket.connect(str(host), domain, timeout=timeout)
+                    try:
+                        with self._cfg_lock:
+                            self.ws_domain_pref[dc_key] = str(domain)
+                            self._bump_route_version()
+                    except Exception:
+                        pass
+                    return ws
+                except Exception as exc:
+                    last_exc = exc
+                    if " 30" in str(exc):
+                        redirects += 1
+                        continue
+                    continue
+        if redirects and redirects >= len(domains):
+            # RES-06: blacklist with a bounded TTL (auto-expires) instead of a
+            # permanent set entry, under _cfg_lock inside the helper.
+            self._ws_blacklist_add(dc_key)
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("websocket unavailable")
+    def _connect_ws_cf(self, dc, is_media, timeout):
+        # [v2.4.2 warmup] Grab a warm CF spare first — it is already TCP+TLS+WS
+        # established, so this reconnect skips the handshake entirely (near-zero
+        # added latency = lower proxy ping, and the frequent RKN-forced reconnects
+        # become cheap). On a miss, dial fresh below.
+        try:
+            spare = self._ws_pool_get(dc, is_media)
+            if spare is not None:
+                return spare
+        except Exception:
+            pass
+        last_exc = None
+        for domain in self._cf_domains_for_dc(dc, is_media):
+            try:
+                ws = _TgWsRawWebSocket.connect(domain, domain, timeout=timeout)
+                try:
+                    base = str(domain).split(".", 1)[1]
+                    if base:
+                        with self._cfg_lock:
+                            self._cf_pref[int(dc)] = base
+                            self._bump_route_version()
+                except Exception:
+                    pass
+                return ws
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("cf websocket unavailable")
+    def _bridge_tcp_reencrypt(self, client, remote, ctx):
+        done = threading.Event()
+        def _client_to_remote():
+            try:
+                while not done.is_set():
+                    chunk = client.recv(TGWS_RECV_CHUNK)
+                    if not chunk:
+                        break
+                    plain = _tgws_cipher_update(ctx.clt_dec, chunk)
+                    out = _tgws_cipher_update(ctx.tg_enc, plain)
+                    if out:
+                        remote.sendall(out)
+            except Exception:
+                pass
+            try:
+                done.set()
+            except Exception:
+                pass
+            try:
+                self._close_write(remote)
+            except Exception:
+                pass
+        def _remote_to_client():
+            try:
+                while not done.is_set():
+                    chunk = remote.recv(TGWS_RECV_CHUNK)
+                    if not chunk:
+                        break
+                    plain = _tgws_cipher_update(ctx.tg_dec, chunk)
+                    out = _tgws_cipher_update(ctx.clt_enc, plain)
+                    if out:
+                        client.sendall(out)
+            except Exception:
+                pass
+            try:
+                done.set()
+            except Exception:
+                pass
+            try:
+                self._close_write(client)
+            except Exception:
+                pass
+        t1 = threading.Thread(target=_client_to_remote, daemon=True)
+        t2 = threading.Thread(target=_remote_to_client, daemon=True)
+        t1.start(); t2.start()
+        try:
+            while not done.is_set() and (t1.is_alive() or t2.is_alive()):
+                done.wait(0.25)
+        except Exception:
+            pass
+        done.set()
+        for t in (t1, t2):
+            try:
+                if t.is_alive():
+                    t.join(0.5)
+            except Exception:
+                pass
+        for item in (client, remote):
+            try:
+                item.close()
+            except Exception:
+                pass
+            try:
+                self._untrack(item)
+            except Exception:
+                pass
+    # NOTE: We intentionally do NOT proactively reconnect a broken WS.
+    # The TG client owns the retry policy: when the local 127.0.0.1 socket
+    # dies it will re-dial, which spawns a fresh _handle_client -> fresh
+    # ws_pool.get() / dial. Adding a proactive reconnect here would race
+    # with the client's own backoff and double-send queued messages.
+    def _bridge_ws_reencrypt(self, client, ws, ctx, splitter):
+        done = threading.Event()
+        def _client_to_ws():
+            _tgws_lower_thread_priority()
+            try:
+                while not done.is_set():
+                    chunk = client.recv(TGWS_RECV_CHUNK)
+                    if not chunk:
+                        if splitter is not None:
+                            try:
+                                tail = splitter.flush() if hasattr(splitter, "flush") else []
+                            except Exception:
+                                tail = []
+                            for p in list(tail or []):
+                                try:
+                                    ws.send(p)
+                                except Exception:
+                                    break
+                        break
+                    plain = _tgws_cipher_update(ctx.clt_dec, chunk)
+                    data = _tgws_cipher_update(ctx.tg_enc, plain)
+                    if not data:
+                        continue
+                    if splitter is not None:
+                        parts = splitter.split(data)
+                        if not parts:
+                            continue
+                        if len(parts) > 1:
+                            try:
+                                ws.send_batch(parts)
+                            except Exception:
+                                for p in parts:
+                                    ws.send(p)
+                        else:
+                            ws.send(parts[0])
+                    else:
+                        ws.send(data)
+                    # [perf upload] Explicit GIL yield after each upload chunk so the
+                    # UI thread can run Python work between large encrypt/send bursts.
+                    time.sleep(0)
+            except Exception:
+                pass
+            try:
+                done.set()
+            except Exception:
+                pass
+        def _ws_to_client():
+            _tgws_lower_thread_priority()
+            idle = 0
+            if TGWS_BRIDGE_KEEPALIVE:
+                try:
+                    ws.sock.settimeout(float(TGWS_BRIDGE_IDLE_PING_SEC))
+                except Exception:
+                    pass
+            try:
+                while not done.is_set():
+                    try:
+                        payload = ws.recv()
+                    except socket.timeout:
+                        # Idle for the ping window. Without keepalive we'd tear the
+                        # tunnel down here (the churn). Instead: ping, then wait
+                        # briefly for a pong or data. Got pong/data -> alive (keep);
+                        # nothing -> dead/throttled -> drop NOW (so a strangled tunnel
+                        # never inflates the proxy ping).
+                        if not TGWS_BRIDGE_KEEPALIVE:
+                            break
+                        if not ws.ping():
+                            break
+                        pong0 = float(getattr(ws, "_last_pong_ts", 0.0) or 0.0)
+                        probe = None
+                        try:
+                            ws.sock.settimeout(float(TGWS_BRIDGE_PONG_WAIT_SEC))
+                            probe = ws.recv()
+                        except socket.timeout:
+                            probe = None
+                        except Exception:
+                            break
+                        finally:
+                            try:
+                                ws.sock.settimeout(float(TGWS_BRIDGE_IDLE_PING_SEC))
+                            except Exception:
+                                pass
+                        if probe:
+                            payload = probe
+                            idle = 0
+                        elif float(getattr(ws, "_last_pong_ts", 0.0) or 0.0) > pong0:
+                            # alive (pong came back) but no data -> hold, but cap pure
+                            # idle so a dormant tunnel recycles ~once a minute.
+                            idle += 1
+                            if idle >= int(TGWS_BRIDGE_MAX_IDLE):
+                                break
+                            continue
+                        else:
+                            break
+                    except Exception:
+                        break
+                    if not payload:
+                        break
+                    idle = 0
+                    plain = _tgws_cipher_update(ctx.tg_dec, payload)
+                    out = _tgws_cipher_update(ctx.clt_enc, plain)
+                    if out:
+                        client.sendall(out)
+            except Exception:
+                pass
+            try:
+                done.set()
+            except Exception:
+                pass
+        t1 = threading.Thread(target=_client_to_ws, daemon=True)
+        t2 = threading.Thread(target=_ws_to_client, daemon=True)
+        t1.start(); t2.start()
+        try:
+            while not done.is_set() and (t1.is_alive() or t2.is_alive()):
+                done.wait(0.25)
+        except Exception:
+            pass
+        done.set()
+        for t in (t1, t2):
+            try:
+                if t.is_alive():
+                    t.join(0.5)
+            except Exception:
+                pass
+        try:
+            ws.close()
+        except Exception:
+            pass
+        try:
+            client.close()
+        except Exception:
+            pass
+        try:
+            self._untrack(ws)
+        except Exception:
+            pass
+        try:
+            self._untrack(client)
+        except Exception:
+            pass
+    def _tcp_fallback_reencrypt(self, client, dc, relay_init, ctx):
+        try:
+            dc_eff = int(TGWS_DC_OVERRIDES.get(int(dc), int(dc)))
+        except Exception:
+            dc_eff = int(dc or 0)
+        dst = str(TGWS_DIRECT_DC_IP.get(int(dc or 0), "") or TGWS_DIRECT_DC_IP.get(int(dc_eff), "") or "").strip()
+        if not dst:
+            dst = str((self.dc_ip or {}).get(str(dc), "") or (self.dc_ip or {}).get(str(dc_eff), "") or "").strip()
+        if not dst:
+            return False
+        try:
+            remote = socket.create_connection((dst, 443), 10.0)
+            self._track(remote)
+            remote.sendall(bytes(relay_init or b""))
+            self._bridge_tcp_reencrypt(client, remote, ctx)
+            return True
+        except Exception:
+            try:
+                client.close()
+            except Exception:
+                pass
+            return False
+    def _handle_client(self, conn):
+        try:
+            conn.settimeout(10.0)
+            init_packet = _tgws_recv_exact(conn, TGWS_HANDSHAKE_LEN)
+            conn.settimeout(None)
+            result = _tgws_try_mtproto_handshake(init_packet, self.secret_bytes)
+            if result is None:
+                return
+            dc, is_media, proto_int, proto_tag, client_dec_prekey_iv = result
+            self._note_active_key(dc, is_media)
+            relay_dc_idx = -int(dc) if bool(is_media) else int(dc)
+            relay_init = _tgws_generate_relay_init(proto_tag, relay_dc_idx)
+            ctx = _tgws_build_crypto_ctx(client_dec_prekey_iv, self.secret_bytes, relay_init)
+            target_ip = str((self.dc_ip or {}).get(str(dc), "") or "").strip()
+            dc_key = self._ws_pool_key(dc, is_media)
+            # [v2.3 sticky-lane] Try lanes in the remembered order (last winning
+            # lane first), each with its OWN backoff/blacklist. A blacklisted or
+            # (for direct) IP-less lane is skipped instantly with no network cost.
+            # The winning lane is promoted to sticky (with hysteresis) so back-to-back
+            # reconnects stop hopping CF<->direct. TCP stays the always-last fallback
+            # and is never recorded as sticky.
+            ws = None
+            for idx, lane in enumerate(self._ordered_lanes(dc_key)):
+                if lane == "direct" and not target_ip:
+                    continue
+                fk = self._lane_fail_key(dc_key, lane)
+                if self._ws_is_blacklisted(fk):
+                    continue
+                # [v2.3 sticky-lane] Timeout policy: give the PREFERRED lane (idx 0)
+                # a full-timeout attempt while its failure streak is still transient
+                # (< hysteresis), so one slow TLS+WS handshake on a high-latency link
+                # can't drop it into the short backoff timeout and spuriously flip the
+                # route away. A genuinely-failing lane (streak >= hysteresis) still
+                # gets the short timeout to fail fast. RES-05b for non-preferred lanes.
+                # [v2.3.1 fix restored] CF and the preferred lane ALWAYS get the full
+                # connect timeout. A CF TLS+WS handshake needs more than the short
+                # backoff window; starving it (the v13 streak-based policy) gave CF
+                # only ~2s once it had a couple recent fails, so the ping overran
+                # Telegram's ~30s deadline and the proxy got dropped. Only a
+                # non-preferred DIRECT lane gets the short backoff timeout.
+                if idx == 0 or lane == "cf":
+                    timeout = float(TGWS_WS_CONNECT_TIMEOUT_SEC)
+                else:
+                    timeout = self._ws_fail_timeout(fk)
+                try:
+                    if lane == "cf":
+                        ws = self._connect_ws_cf(dc, is_media, timeout)
+                    else:
+                        ws = self._connect_ws_direct(dc, is_media, target_ip, timeout)
+                except Exception:
+                    ws = None
+                if ws is not None:
+                    self._ws_fail_clear(fk)
+                    self._lane_record_success(dc_key, lane)
+                    break
+                self._ws_fail_record(fk)
+            if ws is None:
+                try:
+                    self._tcp_fallback_reencrypt(conn, dc, relay_init, ctx)
+                except Exception:
+                    pass
+                return
+            self._track(ws)
+            try:
+                ws.send(relay_init)
+                splitter = None
+                try:
+                    splitter = _TgWsMsgSplitter(relay_init, proto_int)
+                except Exception:
+                    splitter = None
+                self._bridge_ws_reencrypt(conn, ws, ctx, splitter)
+            except Exception:
+                # send()/splitter/bridge raised before the bridge could untrack:
+                # close + untrack the WS here so a LIVE socket never lingers in
+                # self.tracked for the rest of the session.
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                try:
+                    self._untrack(ws)
+                except Exception:
+                    pass
+            return
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            # conn is _track()-ed in _accept_loop BEFORE this thread starts.
+            # Early returns (bad handshake / exception / failed tcp-fallback)
+            # close it but never untracked -> closed sockets pile up in
+            # self.tracked. discard() is idempotent, so this is safe even when
+            # a bridge already untracked conn on the happy path.
+            try:
+                self._untrack(conn)
+            except Exception:
+                pass
+def _tgws_join_channel(username):
+    try:
+        un = str(username or "").strip().lstrip("@")
+        if not un:
+            return
+        event = threading.Event()
+        def do_join():
+            try:
+                rq = TLRPC.TL_contacts_resolveUsername()
+                rq.username = un
+                def on_resolve(r, e):
+                    if e or not r:
+                        event.set()
+                        return
+                    try:
+                        cs = r.chats
+                        if not cs or cs.size() == 0:
+                            event.set()
+                            return
+                        ch = cs.get(0)
+                        if hasattr(ch, 'left') and not ch.left:
+                            event.set()
+                            return
+                        jq = TLRPC.TL_channels_joinChannel()
+                        ic = TLRPC.TL_inputChannel()
+                        ic.channel_id = ch.id
+                        ic.access_hash = ch.access_hash
+                        jq.channel = ic
+                        send_request(jq, RequestCallback(lambda r2, e2: event.set()))
+                    except Exception:
+                        event.set()
+                send_request(rq, RequestCallback(on_resolve))
+            except Exception:
+                event.set()
+        run_on_queue(do_join)
+        event.wait(timeout=5)
+    except Exception:
+        pass
+
+
+class TgWsProxyPlugin(BasePlugin):
+    # [v2.1] Manual update check from Ettacent plugin registry.
+    # Triggered by the "Проверить обновления" button in settings (not on load).
+    def _parse_version(self, v):
+        try:
+            return tuple(map(int, str(v).split(".")))
+        except Exception:
+            return (0,)
+
+    def check_for_update(self):
+        # [v2.3] Manual check ONLY. Fetches the latest version number; if a newer
+        # one exists it is stashed as a PENDING update and an explicit
+        # "Установить обновление" button is surfaced in settings. Nothing is
+        # downloaded or written to disk here — the actual install (download + SHA
+        # check + file swap) runs solely from the user-pressed button
+        # (_on_install_update_clicked -> _do_install_update). This turns every
+        # self-modification into an explicit, user-confirmed action instead of a
+        # silent overwrite triggered just by checking.
+        api_url = "https://update.ettacent.dev/api/plugin-version?id=wsbypass"
+        ua = {"User-Agent": f"wsbypass-updater/{__version__}"}
+        try:
+            r = requests.get(api_url, timeout=10, verify=_CA_BUNDLE, headers=ua)
+            r.raise_for_status()
+            info = r.json() or {}
+        except Exception as e:
+            run_on_ui_thread(
+                lambda err=e: BulletinHelper.show_error(f"Не удалось проверить обновления: {err}")
+            )
+            return
+
+        latest = str(info.get("version") or "").strip()
+        if not latest:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось получить версию"))
+            return
+
+        if self._parse_version(latest) <= self._parse_version(__version__):
+            try:
+                self._pending_update = None
+            except Exception:
+                pass
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_info(f"У вас актуальная версия: {__version__}")
+            )
+            run_on_ui_thread(self._reload_settings_ui)
+            return
+
+        # Stash the pending update; the install only runs on explicit user action.
+        self._pending_update = {
+            "version": latest,
+            "url": info.get("url") or "https://ettacent.dev/plugins/wsbypass.plugin",
+            "sha256": (info.get("sha256") or "").lower().strip() or None,
+        }
+        run_on_ui_thread(
+            lambda v=latest: BulletinHelper.show_info(
+                f"Доступна версия {v} — нажмите «Установить обновление»"
+            )
+        )
+        run_on_ui_thread(self._reload_settings_ui)
+
+    def _on_install_update_clicked(self, v=None):
+        # Explicit user confirmation of the overwrite — run the download+install
+        # off the UI thread so the UI never blocks on the network/file I/O.
+        try:
+            run_on_queue(self._do_install_update)
+        except Exception:
+            try:
+                threading.Thread(
+                    target=self._do_install_update,
+                    name="wsbypass-update-install",
+                    daemon=True,
+                ).start()
+            except Exception:
+                pass
+
+    def _do_install_update(self):
+        # Performs the actual update ONLY after the user pressed "Установить
+        # обновление": download the new .plugin, verify its SHA256 against the value
+        # advertised by the update API, then atomically swap the file (keeping a
+        # .backup that is restored if the write fails).
+        pending = getattr(self, "_pending_update", None)
+        if not pending:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Нет обновления для установки"))
+            return
+        latest = str(pending.get("version") or "").strip()
+        plugin_url = pending.get("url") or "https://ettacent.dev/plugins/wsbypass.plugin"
+        expected_sha = pending.get("sha256")
+        ua = {"User-Agent": f"wsbypass-updater/{__version__}"}
+
+        try:
+            d = requests.get(plugin_url, timeout=30, verify=_CA_BUNDLE, headers=ua)
+            d.raise_for_status()
+            payload = d.content
+        except Exception as e:
+            run_on_ui_thread(
+                lambda err=e: BulletinHelper.show_error(f"Не удалось скачать обновление: {err}")
+            )
+            return
+
+        if not payload:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Пустой ответ сервера"))
+            return
+
+        actual_sha = hashlib.sha256(payload).hexdigest()
+        if expected_sha and actual_sha != expected_sha:
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_error(
+                    "Хеш не совпал — обновление отклонено"
+                )
+            )
+            return
+
+        try:
+            code = payload.decode("utf-8")
+        except Exception as e:
+            run_on_ui_thread(
+                lambda err=e: BulletinHelper.show_error(f"Повреждённое обновление: {err}")
+            )
+            return
+
+        p = __file__
+        try:
+            if os.path.exists(p + ".backup"):
+                os.remove(p + ".backup")
+        except Exception:
+            pass
+        try:
+            os.rename(p, p + ".backup")
+        except Exception:
+            pass
+        try:
+            with open(p, "w", encoding="utf-8") as _f:
+                _f.write(code)
+        except Exception as e:
+            try:
+                if os.path.exists(p + ".backup"):
+                    os.rename(p + ".backup", p)
+            except Exception:
+                pass
+            run_on_ui_thread(
+                lambda err=e: BulletinHelper.show_error(f"Не удалось записать обновление: {err}")
+            )
+            return
+
+        try:
+            self._pending_update = None
+        except Exception:
+            pass
+        run_on_ui_thread(
+            lambda v=latest: BulletinHelper.show_success(
+                f"✅ WS-Bypass обновлён до {v}!\nПерезапустите клиент!"
+            )
+        )
+        run_on_ui_thread(self._reload_settings_ui)
+
+    def _update_settings_items(self, _t):
+        # Build the "About" update controls: always a "Проверить обновления"
+        # button; and, when a newer version is pending, an explicit
+        # "Установить обновление vX" button. The install button is the user's
+        # confirmation step — the file is never overwritten without pressing it.
+        out = [Text(
+            text=_t("Проверить обновления", "Check for updates"),
+            icon="msg_download",
+            on_click=self._on_check_update_clicked,
+        )]
+        pending = getattr(self, "_pending_update", None)
+        if pending:
+            ver = str(pending.get("version") or "")
+            out.append(Text(
+                text=_t(f"⬇️ Установить обновление {ver}", f"⬇️ Install update {ver}"),
+                icon="msg_download",
+                on_click=self._on_install_update_clicked,
+            ))
+        return out
+
+    def _on_check_update_clicked(self, v=None):
+        # Кнопка из настроек — запускаем сетевую работу в фоне,
+        # чтобы UI не подвисал.
+        try:
+            run_on_queue(self.check_for_update)
+        except Exception:
+            try:
+                threading.Thread(
+                    target=self.check_for_update,
+                    name="wsbypass-update-check",
+                    daemon=True,
+                ).start()
+            except Exception:
+                pass
+
+    def _is_advanced_enabled(self) -> bool:
+        return False
+    def _normalize_local_host(self, raw_host) -> str:
+        try:
+            host = str(raw_host or "").strip()
+        except Exception:
+            host = ""
+        if not host or host.lower() == "localhost":
+            return "127.0.0.1"
+        try:
+            socket.inet_aton(host)
+            return host
+        except Exception:
+            return "127.0.0.1"
+    def _local_host(self) -> str:
+        if not self._is_advanced_enabled():
+            return "127.0.0.1"
+        return self._normalize_local_host(self.get_setting("local_socks_host", "127.0.0.1"))
+    def _apply_runtime_local_host(self) -> str:
+        global LOCAL_PROXY_HOST
+        host = self._normalize_local_host(self._local_host())
+        with _TGWS_HOST_LOCK:
+            LOCAL_PROXY_HOST = host
+        return host
+    def _normalize_local_port(self, raw_port) -> int:
+        try:
+            port = int(raw_port)
+        except Exception:
+            port = int(DEFAULT_LOCAL_PROXY_PORT)
+        if port < 1024 or port > 65535:
+            port = int(DEFAULT_LOCAL_PROXY_PORT)
+        return int(port)
+    def _is_local_port_free(self, port: int) -> bool:
+        try:
+            host = self._apply_runtime_local_host()
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((host, int(port)))
+            return True
+        except Exception:
+            return False
+    def _pick_random_local_port(self) -> int:
+        self._apply_runtime_local_host()
+        for _ in range(48):
+            try:
+                p = random.randint(20000, 55000)
+            except Exception:
+                p = 0
+            if p > 0 and self._is_local_port_free(p):
+                return int(p)
+        try:
+            p = int(_get_free_port())
+            if 1024 <= p <= 65535 and self._is_local_port_free(p):
+                return int(p)
+        except Exception:
+            pass
+        return int(DEFAULT_LOCAL_PROXY_PORT)
+    def _local_port(self) -> int:
+        if self._is_advanced_enabled():
+            return self._normalize_local_port(self.get_setting("local_socks_port", int(DEFAULT_LOCAL_PROXY_PORT)))
+        try:
+            cached = int(getattr(self, "_runtime_random_local_port", 0) or 0)
+        except Exception:
+            cached = 0
+        if cached > 0 and self._is_local_port_free(cached):
+            return int(cached)
+        p = int(self._pick_random_local_port())
+        self._runtime_random_local_port = int(p)
+        return int(p)
+    def _wait_local_port_free(self, port: int, timeout_sec: float = 1.8) -> bool:
+        deadline = time.time() + float(max(0.2, timeout_sec))
+        while time.time() < deadline:
+            if self._is_local_port_free(int(port)):
+                return True
+            time.sleep(0.08)
+        return self._is_local_port_free(int(port))
+    def on_plugin_load(self):
+        # RLock guards _tgws_running, _tgws_starting, _tgws_port, _tgws_start_token,
+        # _tgws_start_seq, _tgws_proxy_managed, _tgws_proxy_snapshot,
+        # _runtime_random_local_port and _reload_ui_pending. RLock so re-entrant
+        # call chains (UI -> _start_tgws_runtime -> _tgws_connect_bg -> _tgws_connect)
+        # that all touch flags from the same thread are safe.
+        self._state_lock = threading.RLock()
+        self._tgws_core = TgWsCore()
+        # [v2.3 sticky-lane] Restore persisted route memory so the first connect
+        # after a client restart already takes the proven lane. _route_pref_saved_v
+        # tracks the core's route_version at last save to persist only on change.
+        self._route_pref_saved_v = 0
+        try:
+            _rp = self.get_setting("route_pref", "")
+            if _rp:
+                self._tgws_core.import_route_pref(json.loads(_rp))
+            self._route_pref_saved_v = int(self._tgws_core.route_version())
+        except Exception:
+            pass
+        self._tgws_port = 0
+        self._tgws_running = False
+        self._tgws_proxy_snapshot = None
+        self._tgws_proxy_managed = False
+        self._tgws_last_error = ""
+        self._tgws_starting = False
+        # Monotonic start sequence — replaces time.time() based token, which
+        # could collide between two starts fired within sub-millisecond window.
+        self._tgws_start_seq = 0
+        self._tgws_start_token = 0
+        self._runtime_random_local_port = 0
+        self._reload_ui_pending = False
+        # [v2.1 status-fix] Token of the state last shown by create_settings.
+        # The proxy watchdog compares this against the live state token and
+        # pushes a _reload_settings_ui() when they diverge, so an internal
+        # reconnect that flips starting->running refreshes the settings screen
+        # even though the transition happened off the user-initiated path.
+        self._last_rendered_state = None
+        # [v2.3] Pending update awaiting explicit user confirmation. check_for_update
+        # only sets this (version + url + sha); the actual download+overwrite runs
+        # solely from the user-pressed "Установить обновление" button.
+        self._pending_update = None
+        self._chat_menu_item_id = "tgws_settings_chat"
+        self._drawer_menu_item_id = "tgws_settings_drawer"
+        try:
+            _adv_raw = self.get_setting("advanced_enabled", False)
+            _adv_norm = bool(_adv_raw)
+            if _adv_raw is None or _adv_raw != _adv_norm:
+                self.set_setting("advanced_enabled", _adv_norm, reload_settings=False)
+            _host_norm = self._local_host()
+            if str(self.get_setting("local_socks_host", "") or "") != str(_host_norm):
+                self.set_setting("local_socks_host", _host_norm, reload_settings=False)
+            if self._is_advanced_enabled():
+                _port_raw = self.get_setting("local_socks_port", int(DEFAULT_LOCAL_PROXY_PORT))
+                _port_norm = self._normalize_local_port(_port_raw)
+                if _port_raw != _port_norm:
+                    self.set_setting(
+                        "local_socks_port",
+                        _port_norm,
+                        reload_settings=False,
+                    )
+        except Exception:
+            pass
+        try:
+            self._apply_runtime_local_host()
+        except Exception:
+            pass
+        self._add_menu_items()
+        threading.Thread(
+            target=_tgws_join_channel,
+            args=("th3nek1t_projects",),
+            daemon=True,
+            name="tgws-join-channel",
+        ).start()
+        # Relabel our own 127.0.0.1 row in Telegram's proxy panel as TGWS_PROXY_LABEL.
+        # Guarded: if the cell class isn't present in this build, the row just shows
+        # the raw address and nothing breaks.
+        self._tgws_label_hook = None
+        try:
+            _cell_cls = find_class("org.telegram.ui.ProxyListActivity$TextDetailProxyCell")
+            if _cell_cls is not None:
+                self._tgws_label_hook = self.hook_all_methods(_cell_cls, "setProxy", _TgwsProxyLabelHook())
+        except Exception:
+            self._tgws_label_hook = None
+        if bool(self.get_setting("tgws_enabled", False)):
+            self._start_tgws_runtime(auto_start=True, delay_ms=int(TGWS_AUTOSTART_DELAY_MS))
+    def on_plugin_unload(self):
+        try:
+            _lh = getattr(self, "_tgws_label_hook", None)
+            if _lh is not None:
+                if isinstance(_lh, list):
+                    for _x in _lh:
+                        try:
+                            self.unhook_method(_x)
+                        except Exception:
+                            pass
+                else:
+                    self.unhook_method(_lh)
+            self._tgws_label_hook = None
+        except Exception:
+            pass
+        try:
+            _tgws_cf_refresh_stop.set()
+        except Exception:
+            pass
+        # [v2.3 sticky-lane] persist learned routes before shutdown.
+        try:
+            self._tgws_persist_route_pref(force=True)
+        except Exception:
+            pass
+        try:
+            with self._state_lock:
+                self._tgws_running = False
+                self._tgws_starting = False
+                self._tgws_start_seq = int(getattr(self, "_tgws_start_seq", 0) or 0) + 1
+                self._tgws_start_token = int(self._tgws_start_seq)
+        except Exception:
+            pass
+        try:
+            self._tgws_core.stop()
+        except Exception:
+            pass
+        try:
+            self._tgws_restore_previous_proxy()
+        except Exception:
+            pass
+        try:
+            _apply_tg_proxy(0, False)
+        except Exception:
+            pass
+        try:
+            self._tgws_force_clear_current_proxy()
+        except Exception:
+            pass
+        try:
+            self._tgws_remove_local_from_list()
+        except Exception:
+            pass
+        try:
+            self._remove_menu_items()
+        except Exception:
+            pass
+
+    def _tgws_force_clear_current_proxy(self):
+        try:
+            shared_config_cls = find_class("org.telegram.messenger.SharedConfig")
+            if not shared_config_cls:
+                return
+            current = self._tgws_get_static_field(shared_config_cls, "currentProxyInfo", None)
+            if current is None:
+                return
+            try:
+                addr = str(getattr(current, "address", "") or "")
+            except Exception:
+                addr = ""
+            if addr == LOCAL_PROXY_HOST:
+                try:
+                    self._tgws_set_static_field(shared_config_cls, "currentProxyInfo", None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    def on_app_event(self, event_type):
+        try:
+            AppEvent = find_class("com.exteragram.messenger.plugins.AppEvent")
+            if not AppEvent:
+                return
+            if event_type in (AppEvent.START, AppEvent.RESUME):
+                try:
+                    with self._state_lock:
+                        _running = bool(getattr(self, "_tgws_running", False))
+                        _busy = _running or bool(getattr(self, "_tgws_starting", False))
+                except Exception:
+                    _running = bool(getattr(self, "_tgws_running", False))
+                    _busy = _running or bool(getattr(self, "_tgws_starting", False))
+                _enabled = bool(self.get_setting("tgws_enabled", False))
+                # [morning-bug fix] Auto-recover after idle/Doze. When the app returns
+                # to the foreground (the morning case), the per-lane blacklist + fail
+                # backoff accumulated while the network was down is STALE: the next
+                # reconnect eats short/blacklisted timeouts and overruns Telegram's
+                # ~30s deadline -> dropped proxy ("ping not found"). reset_resilience_
+                # state() wipes exactly the 4 backoff/blacklist dicts that the manual
+                # OFF/ON toggle's start() clears, so the reconnect is a clean slate.
+                # This is the dead-but-intended RES-06c recovery wired to its real
+                # trigger. Pool/lane_pref are left alone (the toggle doesn't need them
+                # to cure it; the pool is empty by default). O(1), runs only when a
+                # live runtime exists, so it cannot race the start path.
+                if _enabled and _running:
+                    try:
+                        self._tgws_core.reset_resilience_state()
+                    except Exception:
+                        pass
+                if _enabled and not _busy:
+                    self._start_tgws_runtime(auto_start=True, delay_ms=int(TGWS_RESUME_START_DELAY_MS))
+        except Exception:
+            pass
+    def _tgws_state_token(self):
+        # Canonical token mirroring exactly what create_settings renders, so the
+        # watchdog can detect when the on-screen status has gone stale.
+        try:
+            if not bool(self.get_setting("tgws_enabled", False)):
+                return "off"
+        except Exception:
+            pass
+        try:
+            if bool(getattr(self, "_tgws_running", False)):
+                return "running"
+            if bool(getattr(self, "_tgws_starting", False)):
+                return "starting"
+            return "failed"
+        except Exception:
+            return "starting"
+    def create_settings(self):
+        def _t(ru, en):
+            try:
+                return ru if _is_ru_language() else en
+            except Exception:
+                return en
+
+        enabled = bool(self.get_setting("tgws_enabled", False))
+
+        items = [
+            Header(text=_t("Главное", "General")),
+            Switch(
+                key="tgws_enabled",
+                text=_t("Включить туннель", "Enable tunnel"),
+                default=False,
+                on_change=self._on_enabled_changed,
+            ),
+        ]
+
+        if not enabled:
+            items.append(Divider(text=_t(
+                "Включите, чтобы Telegram работал в обход блокировок.",
+                "Turn on to keep Telegram working in Russia.",
+            )))
+            items.append(Header(text=_t("О плагине", "About")))
+            for _it in self._update_settings_items(_t):
+                items.append(_it)
+            items.append(Text(text=Z("author_channel"), icon="msg_channel", on_click=lambda v: self._open_author_channel()))
+            items.append(Divider(text=Z("about")))
+            self._last_rendered_state = "off"
+            return items
+
+        try:
+            running = bool(getattr(self, "_tgws_running", False))
+            starting = bool(getattr(self, "_tgws_starting", False))
+            if running:
+                status = f"\U0001F7E2 {Z('state_connected')}"
+                self._last_rendered_state = "running"
+            elif starting:
+                status = f"\U0001F7E1 {Z('state_starting')}"
+                self._last_rendered_state = "starting"
+            else:
+                status = f"\U0001F534 {Z('state_failed')}"
+                self._last_rendered_state = "failed"
+        except Exception:
+            status = f"\U0001F7E1 {Z('state_starting')}"
+            try:
+                self._last_rendered_state = "starting"
+            except Exception:
+                pass
+        items.append(Text(text=status, icon="msg_info"))
+        items.append(Text(
+            text=_t("Открыть настройки прокси", "Open proxy settings"),
+            icon="msg_settings",
+            on_click=lambda v: self._open_tg_proxy_settings(),
+        ))
+        items.append(Divider())
+
+        items.append(Header(text=_t("О плагине", "About")))
+        for _it in self._update_settings_items(_t):
+            items.append(_it)
+        items.append(Text(text=Z("author_channel"), icon="msg_channel", on_click=lambda v: self._open_author_channel()))
+        items.append(Divider(text=Z("about")))
+        return items
+    def _start_tgws_runtime(self, auto_start=False, delay_ms=0):
+        try:
+            # Transactional check-and-set: only ONE caller can win the race to set
+            # _tgws_starting=True and capture the new start sequence number.
+            with self._state_lock:
+                if bool(getattr(self, "_tgws_running", False)) or bool(getattr(self, "_tgws_starting", False)):
+                    return
+                if bool(auto_start) and not bool(self.get_setting("tgws_enabled", False)):
+                    return
+                self._tgws_starting = True
+                self._tgws_start_seq = int(getattr(self, "_tgws_start_seq", 0) or 0) + 1
+                self._tgws_start_token = int(self._tgws_start_seq)
+                token = int(self._tgws_start_token)
+        except Exception:
+            token = -1
+        def _run():
+            try:
+                # Recheck token under lock — if another disconnect/start fired after we
+                # were scheduled, the counter advanced and we must abort.
+                with self._state_lock:
+                    if int(getattr(self, "_tgws_start_token", 0) or 0) != int(token):
+                        return
+                    if bool(auto_start) and not bool(self.get_setting("tgws_enabled", False)):
+                        self._tgws_starting = False
+                        return
+                threading.Thread(target=self._tgws_connect_bg, kwargs={"auto_start": bool(auto_start)}, daemon=True).start()
+            except Exception:
+                try:
+                    with self._state_lock:
+                        self._tgws_starting = False
+                except Exception:
+                    pass
+        try:
+            d = int(delay_ms or 0)
+        except Exception:
+            d = 0
+        if d > 0:
+            try:
+                run_on_ui_thread(_run, d)
+                return
+            except Exception:
+                pass
+        _run()
+    def _tgws_connect_bg(self, auto_start=False):
+        ok = False
+        try:
+            ok = bool(self._tgws_connect(auto_start=bool(auto_start)))
+        except Exception as e:
+            try:
+                self._tgws_last_error = str(e)
+            except Exception:
+                pass
+            ok = False
+        if not ok:
+            try:
+                with self._state_lock:
+                    self._tgws_starting = False
+            except Exception:
+                pass
+            msg = Z("tgws_connect_failed")
+            try:
+                last = str(getattr(self, "_tgws_last_error", "") or "").strip()
+                if last:
+                    msg = f"{Z('tgws_connect_failed')}: {last}"
+            except Exception:
+                pass
+            try:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(str(msg)))
+            except Exception:
+                pass
+            if not bool(auto_start):
+                try:
+                    self.set_setting("tgws_enabled", False, reload_settings=True)
+                except Exception:
+                    pass
+            try:
+                run_on_ui_thread(self._reload_settings_ui)
+            except Exception:
+                pass
+    def _tgws_get_static_field(self, cls, name, default=None):
+        try:
+            f = _tgws_cached_field(cls, str(name))
+            return f.get(None)
+        except Exception:
+            return default
+    def _tgws_set_static_field(self, cls, name, value):
+        try:
+            f = _tgws_cached_field(cls, str(name))
+            f.set(None, value)
+        except Exception:
+            pass
+    def _tgws_snapshot_current_proxy(self):
+        # [security-review note] Non-destructive guarantee: before the plugin points
+        # Telegram at its local proxy it copies the user's CURRENT proxy (enabled
+        # flag + address/port/user/password/secret) into an in-memory snapshot via
+        # reflection read-only. _tgws_restore_previous_proxy() puts this back verbatim
+        # on disable/unload, so toggling the plugin off leaves the user's own proxy
+        # setup exactly as it was. Read-only reflection; nothing is persisted offsite.
+        if self._tgws_proxy_snapshot is not None:
+            return
+        try:
+            shared_config_cls = find_class("org.telegram.messenger.SharedConfig")
+            current = self._tgws_get_static_field(shared_config_cls, "currentProxyInfo", None)
+            enabled = bool(self._tgws_get_static_field(shared_config_cls, "useProxySettings", False))
+            snapshot = {"enabled": enabled, "host": "", "port": 0, "user": "", "password": "", "secret": ""}
+            if current:
+                snapshot["host"] = str(get_private_field(current, "address") or "")
+                snapshot["port"] = int(get_private_field(current, "port") or 0)
+                snapshot["user"] = str(get_private_field(current, "username") or "")
+                snapshot["password"] = str(get_private_field(current, "password") or "")
+                snapshot["secret"] = str(get_private_field(current, "secret") or "")
+            self._tgws_proxy_snapshot = snapshot
+        except Exception:
+            pass
+    def _tgws_restore_previous_proxy(self):
+        if not bool(getattr(self, "_tgws_proxy_managed", False)):
+            return
+        snapshot = getattr(self, "_tgws_proxy_snapshot", None)
+        try:
+            if snapshot is None:
+                return
+            enabled = bool(snapshot.get("enabled", False))
+            host = str(snapshot.get("host", "") or "")
+            port = int(snapshot.get("port", 0) or 0)
+            user = str(snapshot.get("user", "") or "")
+            password = str(snapshot.get("password", "") or "")
+            secret = str(snapshot.get("secret", "") or "")
+            shared_config_cls = find_class("org.telegram.messenger.SharedConfig")
+            try:
+                self._tgws_set_static_field(shared_config_cls, "useProxySettings", bool(enabled))
+            except Exception:
+                pass
+            try:
+                if host and port > 0:
+                    ProxyInfo = jclass("org.telegram.messenger.SharedConfig$ProxyInfo")
+                    pinfo = ProxyInfo(host, int(port), user, password, secret)
+                    try:
+                        self._tgws_set_static_field(shared_config_cls, "currentProxyInfo", pinfo)
+                    except Exception:
+                        pass
+                    try:
+                        SharedConfig.addProxy(pinfo)
+                    except Exception:
+                        pass
+                else:
+                    self._tgws_set_static_field(shared_config_cls, "currentProxyInfo", None)
+            except Exception:
+                pass
+            try:
+                ConnectionsManager.setProxySettings(bool(enabled), host, int(port), user, password, secret)
+            except Exception:
+                try:
+                    for ac in range(UserConfig.MAX_ACCOUNT_COUNT):
+                        cm = ConnectionsManager.getInstance(ac)
+                        if cm:
+                            cm.setProxySettings(bool(enabled), host, int(port), user, password, secret)
+                except Exception:
+                    pass
+        finally:
+            try:
+                self._tgws_proxy_managed = False
+            except Exception:
+                pass
+            try:
+                self._tgws_proxy_snapshot = None
+            except Exception:
+                pass
+    def _tgws_get_or_create_secret(self):
+        cached = getattr(self, "_tgws_secret_cache", "") or ""
+        if cached:
+            return cached
+        try:
+            current = _tgws_valid_secret_hex(self.get_setting("mtproto_secret", ""))
+        except Exception:
+            current = ""
+        if current:
+            try:
+                self._tgws_secret_cache = current
+            except Exception:
+                pass
+            return current
+        current = _tgws_generate_secret_hex()
+        try:
+            self.set_setting("mtproto_secret", current, reload_settings=False)
+        except Exception:
+            pass
+        try:
+            self._tgws_secret_cache = current
+        except Exception:
+            pass
+        return current
+    def _tgws_connect(self, auto_start=False):
+        try:
+            self._apply_runtime_local_host()
+            port = int(self._local_port())
+            if not self._wait_local_port_free(port, timeout_sec=0.8):
+                try:
+                    self._tgws_last_error = f"{Z('local_port_busy')}: {port}"
+                except Exception:
+                    pass
+                return False
+            if int(port or 0) <= 0:
+                try:
+                    self._tgws_last_error = Z("tgws_no_port")
+                except Exception:
+                    pass
+                self._tgws_running = False
+                self._tgws_port = 0
+                try:
+                    self._tgws_starting = False
+                except Exception:
+                    pass
+                return False
+            self._tgws_port = int(port)
+            secret_hex = self._tgws_get_or_create_secret()
+            config_json = json.dumps({"port": int(port), "verbose": False})
+            err = self._tgws_core.start(config_json, secret_hex=secret_hex)
+            if err:
+                try:
+                    self._tgws_last_error = str(err)
+                except Exception:
+                    pass
+                try:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(str(err)))
+                except Exception:
+                    pass
+                self._tgws_running = False
+                self._tgws_port = 0
+                try:
+                    self._tgws_starting = False
+                except Exception:
+                    pass
+                return False
+            # start() уже сделал listener.bind() + listen(): порт открыт в момент
+            # возврата, поэтому применяем прокси сразу, без watchdog-поллинга.
+            _secret = str(secret_hex or "")
+            try:
+                self._tgws_snapshot_current_proxy()
+            except Exception:
+                pass
+            try:
+                self._tgws_proxy_managed = True
+            except Exception:
+                pass
+            try:
+                _apply_tg_proxy(int(port), True, secret=_secret)
+            except Exception as _e:
+                try:
+                    self._tgws_last_error = str(_e)
+                except Exception:
+                    pass
+            # [lock-7 redo] The JNI/proxy work (_apply_tg_proxy above) ran OUTSIDE
+            # _state_lock to avoid a UI freeze. Only the Python flag transition is
+            # made atomic here — a tiny lock-held critical section.
+            try:
+                with self._state_lock:
+                    self._tgws_running = True
+                    self._tgws_starting = False
+            except Exception:
+                self._tgws_running = True
+                try:
+                    self._tgws_starting = False
+                except Exception:
+                    pass
+            try:
+                self.set_setting("tgws_enabled", True, reload_settings=False)
+            except Exception:
+                pass
+            try:
+                # [v2.1 status-fix] Always refresh the settings UI on a successful
+                # (re)connect — including auto_start/reconnect paths. Previously this
+                # was gated behind `not auto_start`, so an auto-start or internal
+                # reconnect would flip the flags to running=True/starting=False but
+                # leave the settings screen stuck on the yellow "Starting" status
+                # until the user navigated out and back in.
+                self._reload_settings_ui(delay_ms=400)
+            except Exception:
+                pass
+            try:
+                if bool(TGWS_SHOW_SUCCESS_BULLETIN) and not bool(auto_start):
+                    BulletinHelper.show_success(Z("tgws_connected"))
+            except Exception:
+                pass
+            # [v2.1 coexist] health-check: если другой плагин (или ручная чистка
+            # из настроек прокси Telegram) удалит наш 127.0.0.1 entry из
+            # SharedConfig.proxyList пока tgws активен — re-install через
+            # _apply_tg_proxy. Это страховка против coexistence с
+            # th3_proxy_tools.plugin и любыми будущими cleanup-инструментами.
+            try:
+                self._tgws_start_proxy_watchdog(int(port), str(_secret or ""))
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            self._tgws_running = False
+            self._tgws_port = 0
+            try:
+                self._tgws_starting = False
+            except Exception:
+                pass
+            try:
+                self._tgws_last_error = str(exc)
+            except Exception:
+                pass
+            try:
+                self._tgws_core.stop()
+            except Exception:
+                pass
+            return False
+
+    # [v2.1 coexist] proxy-list watchdog: на каждом тике проверяет, что наш
+    # 127.0.0.1 entry всё ещё в SharedConfig.proxyList. Если другой плагин
+    # (или ручная чистка) его удалит, мы re-install'им через _apply_tg_proxy.
+    # Тред умирает сам как только _tgws_running становится False.
+    def _tgws_start_proxy_watchdog(self, port, secret):
+        # Если уже крутится — не плодим второй.
+        if bool(getattr(self, "_tgws_watchdog_running", False)):
+            return
+        self._tgws_watchdog_running = True
+        host = LOCAL_PROXY_HOST
+        port_i = int(port or 0)
+        secret_s = str(secret or "")
+        plugin = self
+
+        def _loop():
+            try:
+                while bool(getattr(plugin, "_tgws_running", False)):
+                    try:
+                        time.sleep(30.0)
+                    except Exception:
+                        break
+                    if not bool(getattr(plugin, "_tgws_running", False)):
+                        break
+                    try:
+                        pl = getattr(SharedConfig, "proxyList", None)
+                        found = False
+                        if pl:
+                            with _TGWS_PROXYLIST_LOCK:
+                                snap = list(pl)
+                            for p in snap:
+                                try:
+                                    if str(getattr(p, "address", "")) == host and int(getattr(p, "port", 0) or 0) == port_i:
+                                        found = True
+                                        break
+                                except Exception:
+                                    continue
+                        if not found:
+                            try:
+                                _log("tgws watchdog: 127.0.0.1 entry vanished, re-installing")
+                            except Exception:
+                                pass
+                            try:
+                                _apply_tg_proxy(port_i, True, secret=secret_s)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    # [v2.1 status-fix] Safety net for a stale settings screen: if the
+                    # live state token no longer matches what create_settings last
+                    # rendered (e.g. an internal reconnect flipped starting->running
+                    # off the user-initiated path), push a UI refresh. Only fires once
+                    # the settings screen has rendered at least once
+                    # (_last_rendered_state is not None), and self-heals by storing the
+                    # current token so it cannot re-fire every tick.
+                    try:
+                        last = getattr(plugin, "_last_rendered_state", None)
+                        if last is not None:
+                            cur = plugin._tgws_state_token()
+                            if str(cur) != str(last):
+                                plugin._last_rendered_state = cur
+                                plugin._reload_settings_ui()
+                    except Exception:
+                        pass
+                    # [v2.3 sticky-lane] Persist learned routes if they changed this
+                    # tick, so a later crash/kill keeps the proven lane for next start.
+                    try:
+                        plugin._tgws_persist_route_pref()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    plugin._tgws_watchdog_running = False
+                except Exception:
+                    pass
+
+        try:
+            threading.Thread(target=_loop, name="tgws-watchdog", daemon=True).start()
+        except Exception:
+            try:
+                self._tgws_watchdog_running = False
+            except Exception:
+                pass
+
+    def _tgws_disconnect(self, silent=False):
+        # [v2.3 sticky-lane] flush learned routes before tearing the core down.
+        try:
+            self._tgws_persist_route_pref(force=True)
+        except Exception:
+            pass
+        # core.stop() does I/O / thread join — keep OUTSIDE the state lock.
+        try:
+            self._tgws_core.stop()
+        except Exception:
+            pass
+        # Atomic flag clear + token bump. Bumping _tgws_start_seq invalidates any
+        # delayed _run() still pending in run_on_ui_thread.
+        try:
+            with self._state_lock:
+                self._tgws_running = False
+                self._tgws_port = 0
+                self._tgws_starting = False
+                self._tgws_start_seq = int(getattr(self, "_tgws_start_seq", 0) or 0) + 1
+                self._tgws_start_token = int(self._tgws_start_seq)
+        except Exception:
+            pass
+        try:
+            self._tgws_restore_previous_proxy()
+        except Exception:
+            _apply_tg_proxy(0, False)
+        # [v2.2 side-quest] явно вычистить наш 127.0.0.1 entry из
+        # SharedConfig.proxyList — restore_previous_proxy переставляет
+        # currentProxy на старый, но локальная запись могла остаться
+        # болтаться в списке и мозолить глаза в Settings → Прокси,
+        # особенно если параллельно стоит th3_proxy_tools.
+        try:
+            self._tgws_remove_local_from_list()
+        except Exception:
+            pass
+        if not silent:
+            self._reload_settings_ui()
+
+    # [v2.2 side-quest] удалить все наши 127.0.0.1-entries из proxyList
+    # (с любым портом, на случай если порт менялся между сессиями).
+    def _tgws_remove_local_from_list(self):
+        try:
+            SharedConfig.loadProxyList()
+        except Exception:
+            pass
+        try:
+            with _TGWS_PROXYLIST_LOCK:
+                pl = getattr(SharedConfig, "proxyList", None)
+                if not pl:
+                    return
+                snap = list(pl)
+            to_remove = []
+            for p in snap:
+                try:
+                    if str(getattr(p, "address", "")) == LOCAL_PROXY_HOST:
+                        to_remove.append(p)
+                except Exception:
+                    continue
+            if not to_remove:
+                return
+            for p in to_remove:
+                try:
+                    SharedConfig.deleteProxy(p)
+                except Exception:
+                    pass
+            try:
+                SharedConfig.saveProxyList()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # [v2.3 sticky-lane] Persist the core's learned route memory to settings, but
+    # only when it actually changed (route_version moved) unless force=True. Called
+    # on the watchdog tick (every 30s), on disconnect and on unload.
+    def _tgws_persist_route_pref(self, force=False):
+        try:
+            core = getattr(self, "_tgws_core", None)
+            if core is None:
+                return
+            v = int(core.route_version())
+            if not force and v == int(getattr(self, "_route_pref_saved_v", -1)):
+                return
+            data = core.export_route_pref()
+            if not data:
+                return
+            self.set_setting("route_pref", json.dumps(data), reload_settings=False)
+            self._route_pref_saved_v = v
+        except Exception:
+            pass
+
+    def _on_enabled_changed(self, v):
+        enabled = bool(v)
+        if enabled:
+            self._start_tgws_runtime(auto_start=False, delay_ms=TGWS_SOFT_RESTART_DELAY_MS)
+        else:
+            # [PATCH v2.0] Атомарно сбрасываем флаги ПЕРЕД disconnect, чтобы
+            # быстрый OFF→ON не блокировался guard'ом в _start_tgws_runtime.
+            try:
+                with self._state_lock:
+                    self._tgws_running = False
+                    self._tgws_starting = False
+            except Exception:
+                pass
+            self._tgws_disconnect()
+        self._reload_settings_ui()
+    def _reload_settings_ui(self, delay_ms=100):
+        try:
+            if bool(getattr(self, "_reload_ui_pending", False)):
+                return
+            self._reload_ui_pending = True
+        except Exception:
+            pass
+        def _do():
+            try:
+                self._reload_ui_pending = False
+            except Exception:
+                pass
+            try:
+                self.set_setting("__reload__", time.time(), reload_settings=True)
+            except Exception:
+                pass
+        try:
+            run_on_ui_thread(_do, int(delay_ms))
+        except Exception:
+            pass
+    def _open_tg_proxy_settings(self):
+        try:
+            frag = get_last_fragment()
+            if frag:
+                from org.telegram.ui import ProxyListActivity
+                frag.presentFragment(ProxyListActivity())
+        except Exception:
+            pass
+    def _open_author_channel(self):
+        try:
+            from org.telegram.messenger.browser import Browser
+            frag = get_last_fragment()
+            ctx = frag.getParentActivity() if frag else None
+            if ctx is None:
+                return
+            Browser.openUrl(ctx, "https://t.me/th3nek1t_projects")
+        except Exception:
+            pass
+    def _add_menu_items(self):
+        def on_click(ctx):
+            self._open_settings()
+        try:
+            self.remove_menu_item(self._chat_menu_item_id)
+        except Exception:
+            pass
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                item_id=self._chat_menu_item_id,
+                text=Z("menu_settings"),
+                on_click=on_click,
+                icon="msg_settings",
+                priority=1,
+            ))
+        except Exception:
+            pass
+        try:
+            self.remove_menu_item(self._drawer_menu_item_id)
+        except Exception:
+            pass
+        try:
+            self.add_menu_item(MenuItemData(
+                menu_type=MenuItemType.DRAWER_MENU,
+                item_id=self._drawer_menu_item_id,
+                text=Z("menu_settings"),
+                on_click=on_click,
+                icon="msg_settings",
+                priority=1,
+            ))
+        except Exception:
+            pass
+    def _remove_menu_items(self):
+        try:
+            self.remove_menu_item(self._chat_menu_item_id)
+        except Exception:
+            pass
+        try:
+            self.remove_menu_item(self._drawer_menu_item_id)
+        except Exception:
+            pass
+    def _open_settings(self):
+        try:
+            PC = find_class("com.exteragram.messenger.plugins.PluginsController")
+        except Exception:
+            PC = None
+        try:
+            PSA = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+        except Exception:
+            PSA = None
+        try:
+            if PC:
+                inst = None
+                try:
+                    inst = PC.getInstance()
+                except Exception:
+                    inst = None
+                if inst is not None and hasattr(inst, "plugins") and PSA:
+                    plugin_obj = None
+                    try:
+                        plugin_obj = inst.plugins.get(self.id)
+                    except Exception:
+                        plugin_obj = None
+                    if plugin_obj is not None:
+                        frag = get_last_fragment()
+                        if frag is not None:
+                            frag.presentFragment(PSA(plugin_obj))
+                            return
+                try:
+                    PC.openPluginSettings(self.id)
+                    return
+                except Exception:
+                    pass
+            frag = get_last_fragment()
+            if frag and PC:
+                PC.getInstance().openPluginSettings(self.id, frag)
+        except Exception:
+            pass

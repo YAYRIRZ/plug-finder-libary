@@ -1,0 +1,279 @@
+__id__ = "plugin_generator_by_grt_pg"
+__name__ = "PluginGRT Generator"
+__description__ = "Создает плагины с помощью ИИ. Команды: `.genplugin <описание>` и `.genplugin_regen` для повторной генерации."
+__version__ = "1.7.0"
+__author__ = "@muichiro690 & @PluginIDEbot & @voodyminingg"
+__icon__ = "sPluginIDE/4"
+__min_version__ = "11.12.0"
+
+import requests
+import threading
+import re
+import traceback
+import os
+import ast
+from typing import Any, Union, Dict, Optional
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import send_message, get_last_fragment
+from android_utils import run_on_ui_thread
+from ui.bulletin import BulletinHelper
+from ui.alert import AlertDialogBuilder
+from ui.settings import Header, Input, Selector, Divider, Switch, Text
+from java.io import File
+from com.exteragram.messenger.plugins import PluginsController
+from java import dynamic_proxy
+from android.os import Environment
+from org.telegram.messenger import AndroidUtilities
+
+API_URL = "https://exterapl-api.hnaha2971.workers.dev"
+API_KEY = "ex-zX1cV5bN9mQ2wE6rT4yU7iP0oA3sD"
+AVAILABLE_MODELS = [
+    "gpt-4.1-nano", "gpt-4.1-mini", "gpt-4.1-base",
+    "claude-3-5-haiku", "claude-3-5-sonnet", "llama-3.3-70b",
+    "qwq-32b", "qwen-2.5-72b", "gemini-2.0-flash",
+    "deepseek-v3", "deepseek-r1", "mythomax-l2-13b"
+]
+PLUGIN_SAVE_FOLDER_NAME = "PluginGRT_Generated"
+
+def get_id_from_file(file_path: str) -> Union[str, None]:
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            tree = ast.parse(file.read(), filename=file_path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "__id__":
+                        return ast.literal_eval(node.value)
+    except Exception:
+        return None
+    return None
+
+class PluginGRTGeneratorPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._plugin_save_path = None
+        self.last_user_prompt = None
+        self.models_cache = []
+
+    def _get_prompt_content(self) -> str:
+        prompt_parts = [
+            "Ты — PluginGRT, элитный разработчик плагинов для exteraGram. Твоя задача — создавать безупречный, готовый к работе код, строго следуя приведенным ниже инструкциям и шаблонам.",
+            "## ГЛАВНЫЕ ПРАВИЛА",
+            "1.  **НЕ ВЫДУМЫВАЙ КОД.** Используй ТОЛЬКО РЕАЛЬНЫЕ функции и методы из примеров.",
+            "2.  **ВСЕГДА ДОБАВЛЯЙ МЕТАДАННЫЕ.** Все поля `__id__`, `__name__` и т.д. обязательны.",
+            "3.  **ВЫБИРАЙ ИКОНКУ.** Подбери `__icon__` из списка.",
+            "## STRICT OUTPUT FORMAT",
+            "Твой ответ должен содержать **ТОЛЬКО PYTHON КОД**. Никаких объяснений, `---` или ````python`.",
+            "---",
+            "## ИНСТРУКЦИИ ПО МЕТАДАННЫМ",
+            "```python",
+            "__id__ = \"cool_plugin_pg\"",
+            "__name__ = \"Крутой Плагин\"",
+            "__description__ = \"Этот плагин делает *очень* крутые вещи!\"",
+            "__version__ = \"1.0.0\"",
+            "__author__ = \"@PluginIDEbot\"",
+            "__icon__ = \"sPluginIDE/29\"",
+            "__min_version__ = \"11.12.0\"",
+            "```",
+            "### Список иконок:",
+            "- `sPluginIDE/2`: Чат, - `sPluginIDE/4`: ИИ, - `sPluginIDE/11`: Настройки, - `sPluginIDE/17`: Поиск, - `sPluginIDE/29`: Ракета",
+            "---",
+            "## ШАБЛОН 1: ПРОСТАЯ КОМАНДА",
+            "```python",
+            "__id__ = \"my_simple_command_pg\"\n__name__ = \"Простая Команда\"\n__description__ = \"Отвечает на команду .hello\"\n__version__ = \"1.0.0\"\n__author__ = \"@PluginIDEbot\"\n__icon__ = \"sPluginIDE/2\"\n__min_version__ = \"11.12.0\"",
+            "from typing import Any\nfrom base_plugin import BasePlugin, HookResult, HookStrategy",
+            "class SimpleCommandPlugin(BasePlugin):",
+            "    def on_plugin_load(self):\n        self.add_on_send_message_hook()",
+            "    def on_send_message_hook(self, account: int, params: Any) -> HookResult:",
+            "        if hasattr(params, 'message') and isinstance(params.message, str) and params.message.strip().lower() == \".hello\":",
+            "            params.message = \"Hello from plugin!\"",
+            "            return HookResult(strategy=HookStrategy.MODIFY, params=params)",
+            "        return HookResult()",
+            "```",
+            "---",
+            "## ИТОГОВАЯ ЗАДАЧА\nПроанализируй запрос. Выбери и адаптируй шаблон. Отдай **ТОЛЬКО КОД**.",
+        ]
+        return "\n".join(prompt_parts)
+
+    def _get_system_prompt(self) -> str:
+        return self.get_setting("system_prompt", self._get_prompt_content())
+
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        self._prepare_save_directory()
+        self._fetch_models_async()
+
+    def _fetch_models_async(self):
+        def fetch():
+            try:
+                resp = requests.get(f"{API_URL}/models", timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and data:
+                        self.models_cache = data
+            except Exception:
+                pass
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _prepare_save_directory(self):
+        try:
+            downloads_dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            plugin_save_dir = File(downloads_dir, PLUGIN_SAVE_FOLDER_NAME)
+            if not plugin_save_dir.exists():
+                plugin_save_dir.mkdirs()
+            self._plugin_save_path = plugin_save_dir.getAbsolutePath()
+        except Exception as e:
+            self.log(f"Error creating save directory: {e}")
+            self._plugin_save_path = None
+
+    def create_prompt_settings_fragment(self):
+        return [
+            Header(text="Редактор системного промпта"),
+            Input(key="system_prompt", text="Системный промпт", default=self._get_prompt_content(), icon="msg_edit"),
+            Divider(text="Внимание: Некорректные изменения могут сломать генерацию плагинов.")
+        ]
+
+    def _get_models_for_selector(self):
+        models = self.models_cache if self.models_cache else AVAILABLE_MODELS
+        display_names = [m.replace("gpt-", "GPT-").replace("claude-", "Claude-").replace("llama-", "Llama-").replace("qwq-", "QWQ-").replace("qwen-", "Qwen-").replace("gemini-", "Gemini-").replace("deepseek-", "DeepSeek-") for m in models]
+        return models, display_names
+
+    def create_settings(self):
+        models, display_names = self._get_models_for_selector()
+        return [
+            Header(text="Генератор плагинов"),
+            Input(key="command", text="Команда для генерации", default=".genplugin", icon="input_bot1"),
+            Selector(key="model_index", text="Модель ИИ", items=display_names, default=0, icon="msg_folders_bots"),
+            Input(key="temperature", text="Температура", default="0.9", subtext="0.0-2.0", icon="msg_photo_settings"),
+            Input(key="max_tokens", text="Макс. токенов", default="4096", icon="msg_data"),
+            Switch(key="enable_after_install", text="Включать плагин после установки", default=True, icon="msg_check"),
+            Divider(),
+            Header(text="Продвинутые настройки"),
+            Text(
+                text="Редактировать системный промпт",
+                icon="msg_edit",
+                create_sub_fragment=self.create_prompt_settings_fragment
+            ),
+            Divider(text="Плагин использует API от @voodyminingg")
+        ]
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not hasattr(params, 'message') or not isinstance(params.message, str):
+            return HookResult()
+
+        command = self.get_setting("command", ".genplugin").strip()
+        msg_text = params.message.strip()
+        command_regen = command + "_regen"
+
+        if msg_text.lower().startswith(command + " "):
+            user_prompt = msg_text[len(command):].strip()
+            self.last_user_prompt = user_prompt
+            if not user_prompt:
+                send_message({"peer": params.peer, "message": f"Пример: `{command} плагин, который заменяет 'привет' на 'здравствуй'`"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            self._start_generation(user_prompt, params.peer)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        elif msg_text.lower() == command_regen:
+            if self.last_user_prompt:
+                self._start_generation(self.last_user_prompt, params.peer, is_regen=True)
+            else:
+                BulletinHelper.show_error("Нет запроса для повторной генерации")
+            return HookResult(strategy=HookStrategy.CANCEL)
+        return HookResult()
+
+    def _start_generation(self, user_prompt, peer_id, is_regen=False):
+        if not self._plugin_save_path:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Папка для сохранения плагинов не найдена."))
+            return
+        message = "Повторная генерация..." if is_regen else "Генерация плагина..."
+        BulletinHelper.show_info(message)
+        threading.Thread(target=self._generate_plugin_code, args=(user_prompt, peer_id), daemon=True).start()
+
+    def _generate_plugin_code(self, user_prompt: str, peer_id: int):
+        try:
+            pg_system_prompt = self._get_system_prompt()
+            models, _ = self._get_models_for_selector()
+            selected_model = models[self.get_setting("model_index", 0)]
+            temperature = float(self.get_setting("temperature", "0.9"))
+            max_tokens = int(self.get_setting("max_tokens", "4096"))
+            payload = {
+                "text": f"{pg_system_prompt}\n\nЗапрос пользователя: {user_prompt}",
+                "api_key": API_KEY,
+                "model": selected_model,
+                "max_tokens": max_tokens,
+                "temperature": temperature
+            }
+            response = requests.post(API_URL, json=payload, timeout=240)
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content:
+                content = data.get("response", "")
+            plugin_code = self._extract_code(content)
+            file_name_match = re.search(r"__name__\s*=\s*[\"'](.*?)[\"']", plugin_code)
+            safe_name = re.sub(r'[^\w\-_.]', '_', file_name_match.group(1)) if file_name_match else "generated_plugin"
+            file_path = os.path.join(self._plugin_save_path, f"{safe_name}.plugin")
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(plugin_code)
+            run_on_ui_thread(lambda: self._show_install_bulletin(file_path))
+        except Exception as e:
+            error_text = f"Ошибка при генерации плагина:\n\n{traceback.format_exc()}"
+            self.log(error_text)
+            run_on_ui_thread(lambda: self._show_error_dialog(error_text))
+
+    def _extract_code(self, content: str) -> str:
+        code = content.strip()
+        code = re.sub(r"^```python\n", "", code, flags=re.MULTILINE)
+        code = re.sub(r"\n```$", "", code, flags=re.MULTILINE)
+        cleaned_lines = [line for line in code.splitlines() if not line.strip() == "---"]
+        return "\n".join(cleaned_lines).strip()
+
+    def _show_install_bulletin(self, file_path: str):
+        from org.telegram.messenger import R as R_tg
+        BulletinHelper.show_with_button(
+            text="Плагин готов к установке",
+            icon_res_id=R_tg.raw.ic_download,
+            button_text="Установить",
+            on_click=lambda: self._install_plugin(file_path)
+        )
+
+    def _install_plugin(self, file_path: str):
+        class InstallCallback(dynamic_proxy(PluginsController.Callback)):
+            def __init__(self, plugin_instance, path, enable_after):
+                super().__init__()
+                self.plugin = plugin_instance
+                self.file_path = path
+                self.enable_after = enable_after
+            def run(self, error):
+                if error:
+                    run_on_ui_thread(lambda: self.plugin._show_error_dialog(f"Ошибка установки:\n{error}"))
+                    return
+                if self.enable_after:
+                    plugin_id = get_id_from_file(self.file_path)
+                    if plugin_id:
+                        PluginsController.getInstance().setPluginEnabled(plugin_id, True, self)
+                        self.enable_after = False
+                    else:
+                        BulletinHelper.show_success("Установлено, но не удалось включить")
+                else:
+                    BulletinHelper.show_success("Плагин успешно установлен!")
+        callback = InstallCallback(self, file_path, self.get_setting("enable_after_install", True))
+        PluginsController.getInstance().loadPluginFromFile(file_path, callback)
+
+    def _show_error_dialog(self, error_text: str):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if not activity:
+            BulletinHelper.show_error("Произошла ошибка. См. лог.")
+            return
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Ошибка")
+        builder.set_message("Нажмите 'Копировать' и отправьте разработчику.")
+        def copy_error(bld, which):
+            AndroidUtilities.addToClipboard(error_text)
+            BulletinHelper.show_copied_to_clipboard()
+            bld.dismiss()
+        builder.set_positive_button("Копировать", copy_error)
+        builder.set_negative_button("Закрыть", lambda bld, which: bld.dismiss())
+        builder.show()

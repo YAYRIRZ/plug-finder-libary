@@ -1,0 +1,2692 @@
+import base64
+import json
+import time
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from java import dynamic_proxy, jclass
+from java.lang import Integer
+
+from android.graphics import Typeface
+from android.view import Gravity
+from android.widget import FrameLayout, LinearLayout, ScrollView, TextView
+
+from org.telegram.messenger import (
+    AndroidUtilities,
+    FileLoader,
+    ImageLocation,
+    MessagesController,
+    MessagesStorage,
+    NotificationCenter,
+    UserConfig,
+    Utilities,
+)
+from org.telegram.tgnet import ConnectionsManager, TLRPC
+from org.telegram.tgnet.tl import TL_account
+from org.telegram.ui.ActionBar import AlertDialog, BottomSheet, Theme
+from org.telegram.ui.Cells import TextCheckCell
+from org.telegram.ui.Components import AvatarDrawable, BackupImageView, LayoutHelper
+from org.telegram.ui.Stories.recorder import ButtonWithCounterView
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import RequestCallback
+from ui.bulletin import BulletinHelper
+
+
+__id__ = "profile_clone"
+__name__ = "Profile Clone"
+__description__ = "позволяет легко скопировать чужой профиль, перед копированием автоматически создаётся резервная копия ваших данных"
+__author__ = "@itskotovski & @mishabotov"
+__version__ = "1.0"
+__icon__ = "TgAndroidIcons/100"
+
+
+FIELD_ORDER = (
+    "first_name",
+    "last_name",
+    "bio",
+    "avatar",
+    "birthday",
+    "emoji_status",
+    "name_style",
+    "profile_style",
+    "main_tab",
+    "business_hours",
+    "business_location",
+    "business_intro",
+)
+
+FIELD_LABELS = {
+    "first_name": "Имя",
+    "last_name": "Фамилия",
+    "bio": "О себе",
+    "avatar": "Фото профиля",
+    "birthday": "Дата рождения",
+    "emoji_status": "Эмодзи-статус",
+    "name_style": "Цвет имени",
+    "profile_style": "Цвет профиля",
+    "main_tab": "Основная вкладка",
+    "business_hours": "Часы работы",
+    "business_location": "Адрес",
+    "business_intro": "Приветствие",
+}
+
+
+def as_java_color(value: Any) -> int:
+    raw = int(value) & 0xFFFFFFFF
+    return raw - 0x100000000 if raw >= 0x80000000 else raw
+
+
+def call_int_color(target: Any, method_name: str, color: Any) -> None:
+    value = as_java_color(color)
+    try:
+        method = target.getClass().getMethod(method_name, Integer.TYPE)
+        method.invoke(target, Integer(value))
+    except Exception:
+        getattr(target, method_name)(value)
+
+
+class _ClickListener(
+    dynamic_proxy(jclass("android.view.View$OnClickListener"))
+):
+    def __init__(self, callback: Callable[[], None]):
+        super().__init__()
+        self.callback = callback
+
+    def onClick(self, _view: Any) -> None:
+        self.callback()
+
+
+class _DialogButtonListener(
+    dynamic_proxy(jclass("org.telegram.ui.ActionBar.AlertDialog$OnButtonClickListener"))
+):
+    def __init__(self, callback: Callable[[], None]):
+        super().__init__()
+        self.callback = callback
+
+    def onClick(self, _dialog: Any, _which: int) -> None:
+        self.callback()
+
+
+class _DismissListener(
+    dynamic_proxy(jclass("android.content.DialogInterface$OnDismissListener"))
+):
+    def __init__(self, callback: Callable[[], None]):
+        super().__init__()
+        self.callback = callback
+
+    def onDismiss(self, _dialog: Any) -> None:
+        self.callback()
+
+
+class _UtilitiesCallback(dynamic_proxy(Utilities.Callback)):
+    def __init__(self, callback: Callable[[Any], None]):
+        super().__init__()
+        self.callback = callback
+
+    def run(self, value: Any) -> None:
+        self.callback(value)
+
+
+class _FileEvents(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+    def __init__(self, plugin: "ProfileClonePlugin", account: int):
+        super().__init__()
+        self.plugin = plugin
+        self.account = int(account)
+
+    def didReceivedNotification(self, event_id: int, account: int, *args: Any) -> None:
+        self.plugin._file_event(int(event_id), int(account), args)
+
+
+class ProfileClonePlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._alive = False
+        self._menu_item_ids: List[Any] = []
+        self._session: Optional[Dict[str, Any]] = None
+        self._file_delegates: Dict[int, _FileEvents] = {}
+        self._file_waiters: Dict[
+            Tuple[int, str],
+            Tuple[Dict[str, Any], Callable[[bool, Any], None]],
+        ] = {}
+        self._upload_waiters: Dict[
+            Tuple[int, str],
+            Tuple[Dict[str, Any], Callable[[Any, Optional[str]], None]],
+        ] = {}
+
+    def on_plugin_load(self):
+        self._alive = True
+        self._menu_item_ids.append(self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                item_id="profile_clone_copy",
+                text="Скопировать профиль",
+                icon="msg_copy",
+                condition="user != null && user.self == false && user.deleted == false",
+                priority=35,
+                on_click=self._open_copy,
+            )
+        ))
+        self._menu_item_ids.append(self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.PROFILE_ACTION_MENU,
+                item_id="profile_clone_restore",
+                text="Восстановить свой профиль",
+                icon="msg_reset",
+                condition="user != null && user.self == true",
+                priority=35,
+                on_click=self._open_restore,
+            )
+        ))
+
+    def on_plugin_unload(self):
+        self._alive = False
+        for menu_item_id in self._menu_item_ids:
+            try:
+                self.remove_menu_item(menu_item_id)
+            except Exception:
+                pass
+        self._menu_item_ids.clear()
+        self._destroy_session(dismiss=True)
+        for account, delegate in list(self._file_delegates.items()):
+            try:
+                center = NotificationCenter.getInstance(int(account))
+                center.removeObserver(delegate, NotificationCenter.fileLoaded)
+                center.removeObserver(delegate, NotificationCenter.fileLoadFailed)
+                center.removeObserver(delegate, NotificationCenter.fileUploaded)
+                center.removeObserver(
+                    delegate, NotificationCenter.fileUploadFailed
+                )
+            except Exception:
+                pass
+        self._file_delegates.clear()
+        self._file_waiters.clear()
+        self._upload_waiters.clear()
+
+
+    def _dp(self, value: float) -> int:
+        return int(AndroidUtilities.dp(float(value)))
+
+    def _theme_color(self, key: int, provider: Any, fallback: int) -> int:
+        try:
+            if provider is not None:
+                return as_java_color(Theme.getColor(key, provider))
+            return as_java_color(Theme.getColor(key))
+        except Exception:
+            return as_java_color(fallback)
+
+    def _provider(self, fragment: Any) -> Any:
+        if fragment is None:
+            return None
+        try:
+            return fragment.getResourceProvider()
+        except Exception:
+            try:
+                return fragment.resourcesProvider
+            except Exception:
+                return None
+
+    def _activity(self, fragment: Any) -> Any:
+        if fragment is None:
+            return None
+        try:
+            return fragment.getParentActivity()
+        except Exception:
+            try:
+                return fragment.getContext()
+            except Exception:
+                return None
+
+    def _class_name(self, value: Any) -> str:
+        if value is None:
+            return ""
+        try:
+            return str(value.getClass().getSimpleName())
+        except Exception:
+            return value.__class__.__name__
+
+    def _error_text(self, error: Any, fallback: str = "Неизвестная ошибка") -> str:
+        if error is None:
+            return fallback
+        try:
+            text = str(error.text or "")
+            if text:
+                return text
+        except Exception:
+            pass
+        text = str(error or "").strip()
+        return text or fallback
+
+    def _is_false(self, response: Any) -> bool:
+        return self._class_name(response) == "TL_boolFalse"
+
+    def _to_list(self, value: Any) -> List[Any]:
+        if value is None:
+            return []
+        try:
+            return [item for item in value]
+        except Exception:
+            pass
+        try:
+            return [
+                value.get(index)
+                for index in range(int(value.size()))
+            ]
+        except Exception:
+            return []
+
+    def _input_document(self, document: Any) -> Any:
+        if document is None:
+            return None
+        result = TLRPC.TL_inputDocument()
+        result.id = int(getattr(document, "id", 0) or 0)
+        result.access_hash = int(getattr(document, "access_hash", 0) or 0)
+        result.file_reference = getattr(document, "file_reference", None)
+        if result.file_reference is None:
+            result.file_reference = bytearray()
+        return result
+
+    def _show_error(self, text: str) -> None:
+        try:
+            BulletinHelper.show_error(str(text))
+        except Exception:
+            pass
+
+    def _show_info(self, text: str) -> None:
+        try:
+            BulletinHelper.show_info(str(text))
+        except Exception:
+            pass
+
+    def _backup_key(self, account: int) -> str:
+        return f"profile_backup_{int(account)}"
+
+    def _encode_bytes(self, value: Any) -> str:
+        if value is None:
+            return ""
+        try:
+            return base64.b64encode(bytes(value)).decode("ascii")
+        except Exception:
+            return ""
+
+    def _decode_bytes(self, value: Any) -> bytearray:
+        try:
+            return bytearray(base64.b64decode(str(value or "")))
+        except Exception:
+            return bytearray()
+
+    def _save_document(self, document: Any) -> Optional[Dict[str, Any]]:
+        if document is None:
+            return None
+        document_id = int(getattr(document, "id", 0) or 0)
+        access_hash = int(getattr(document, "access_hash", 0) or 0)
+        if not document_id:
+            return None
+        return {
+            "id": document_id,
+            "access_hash": access_hash,
+            "file_reference": self._encode_bytes(
+                getattr(document, "file_reference", None)
+            ),
+        }
+
+    def _load_document(self, data: Any) -> Any:
+        data = data if isinstance(data, dict) else {}
+        return SimpleNamespace(
+            id=int(data.get("id", 0) or 0),
+            access_hash=int(data.get("access_hash", 0) or 0),
+            file_reference=self._decode_bytes(data.get("file_reference")),
+        )
+
+    def _save_color(self, value: Any) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return {"empty": True}
+        if self._class_name(value) != "TL_peerColor":
+            return None
+        return {
+            "empty": False,
+            "flags": int(getattr(value, "flags", 0) or 0),
+            "color": int(getattr(value, "color", -1) or 0),
+            "background_emoji_id": int(
+                getattr(value, "background_emoji_id", 0) or 0
+            ),
+        }
+
+    def _load_color(self, data: Any) -> Any:
+        if not isinstance(data, dict) or bool(data.get("empty")):
+            return None
+        color = TLRPC.TL_peerColor()
+        color.flags = int(data.get("flags", 0) or 0)
+        color.color = int(data.get("color", 0) or 0)
+        color.background_emoji_id = int(
+            data.get("background_emoji_id", 0) or 0
+        )
+        return color
+
+    def _save_photo(self, photo: Any) -> Optional[Dict[str, Any]]:
+        if photo is None or self._class_name(photo) == "TL_photoEmpty":
+            return None
+        photo_id = int(getattr(photo, "id", 0) or 0)
+        if not photo_id:
+            return None
+        return {
+            "id": photo_id,
+            "access_hash": int(getattr(photo, "access_hash", 0) or 0),
+            "file_reference": self._encode_bytes(
+                getattr(photo, "file_reference", None)
+            ),
+        }
+
+    def _save_business_hours(
+        self, hours: Any
+    ) -> Optional[Dict[str, Any]]:
+        if hours is None:
+            return None
+        timezone_id = str(getattr(hours, "timezone_id", "") or "")
+        periods = self._to_list(getattr(hours, "weekly_open", None))
+        if not timezone_id.strip() or not periods:
+            return None
+        return {
+            "timezone_id": timezone_id,
+            "weekly_open": [
+                {
+                    "start_minute": int(
+                        getattr(item, "start_minute", 0) or 0
+                    ),
+                    "end_minute": int(
+                        getattr(item, "end_minute", 0) or 0
+                    ),
+                }
+                for item in periods
+            ],
+        }
+
+    def _save_backup(self, session: Dict[str, Any]) -> bool:
+        user = session.get("target_user")
+        full = session.get("target_full")
+        if user is None or full is None:
+            return False
+        fields = [
+            key
+            for key in FIELD_ORDER
+            if session.get("selected", {}).get(key)
+            and key not in session.get("unavailable", {})
+        ]
+        status = getattr(user, "emoji_status", None)
+        status_name = self._class_name(status)
+        if "Collectible" in status_name:
+            if "emoji_status" in fields:
+                fields.remove("emoji_status")
+            status_data = None
+        else:
+            until = int(getattr(status, "until", 0) or 0)
+            status_data = {
+                "empty": (
+                    status is None
+                    or status_name == "TL_emojiStatusEmpty"
+                    or (until > 0 and until <= int(time.time()))
+                ),
+                "document_id": int(
+                    getattr(status, "document_id", 0) or 0
+                ),
+                "until": until,
+            }
+        name_color = self._save_color(getattr(user, "color", None))
+        if name_color is None and "name_style" in fields:
+            fields.remove("name_style")
+        profile_color = self._save_color(
+            getattr(user, "profile_color", None)
+        )
+        if profile_color is None and "profile_style" in fields:
+            fields.remove("profile_style")
+
+        birthday = getattr(full, "birthday", None)
+        birthday_data = None
+        if birthday is not None:
+            birthday_data = {
+                "flags": int(getattr(birthday, "flags", 0) or 0),
+                "day": int(getattr(birthday, "day", 0) or 0),
+                "month": int(getattr(birthday, "month", 0) or 0),
+                "year": int(getattr(birthday, "year", 0) or 0),
+            }
+        hours = getattr(full, "business_work_hours", None)
+        hours_data = self._save_business_hours(hours)
+        location = getattr(full, "business_location", None)
+        location_data = None
+        if location is not None:
+            geo = getattr(location, "geo_point", None)
+            location_data = {
+                "address": str(getattr(location, "address", "") or ""),
+                "geo": (
+                    {
+                        "lat": float(getattr(geo, "lat", 0.0) or 0.0),
+                        "long": float(
+                            getattr(geo, "_long", 0.0) or 0.0
+                        ),
+                    }
+                    if geo is not None
+                    and "Empty" not in self._class_name(geo)
+                    else None
+                ),
+            }
+        intro = getattr(full, "business_intro", None)
+        intro_data = None
+        if intro is not None:
+            intro_data = {
+                "title": str(getattr(intro, "title", "") or ""),
+                "description": str(
+                    getattr(intro, "description", "") or ""
+                ),
+                "sticker": self._save_document(
+                    getattr(intro, "sticker", None)
+                ),
+            }
+        snapshot = {
+            "schema": 1,
+            "created_at": int(time.time()),
+            "user_id": int(getattr(user, "id", 0) or 0),
+            "fields": fields,
+            "first_name": str(getattr(user, "first_name", "") or ""),
+            "last_name": str(getattr(user, "last_name", "") or ""),
+            "about": str(getattr(full, "about", "") or ""),
+            "birthday": birthday_data,
+            "emoji_status": status_data,
+            "name_style": name_color,
+            "profile_style": profile_color,
+            "avatar": self._save_photo(
+                getattr(full, "profile_photo", None)
+            ),
+            "main_tab": self._class_name(
+                getattr(full, "main_tab", None)
+            ),
+            "business_hours": hours_data,
+            "business_location": location_data,
+            "business_intro": intro_data,
+        }
+        key = self._backup_key(int(session["account"]))
+        payload = json.dumps(
+            snapshot, ensure_ascii=False, separators=(",", ":")
+        )
+        self.set_setting(key, payload, reload_settings=False)
+        if str(self.get_setting(key, "") or "") != payload:
+            return False
+        session["backup_created"] = True
+        return True
+
+
+    def _new_session(
+        self, account: int, user: Any, fragment: Any, context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        self._destroy_session(dismiss=True)
+        session = {
+            "token": time.time_ns(),
+            "account": int(account),
+            "source_user": user,
+            "source_full": context.get("userFull") if context else None,
+            "target_user": None,
+            "target_full": None,
+            "fragment": fragment,
+            "activity": self._activity(fragment),
+            "provider": self._provider(fragment),
+            "selected": {key: True for key in FIELD_ORDER},
+            "unavailable": {},
+            "results": [],
+            "requests": {},
+            "active_done": None,
+            "callbacks": [],
+            "downloads": [],
+            "uploads": [],
+            "avatar_paths": {},
+            "avatar_sizes": {},
+            "sheet": None,
+            "button": None,
+            "rows": {},
+            "running": False,
+            "completed": False,
+            "destroyed": False,
+            "active_task": 0,
+        }
+        self._session = session
+        return session
+
+    def _valid_session(self, session: Dict[str, Any]) -> bool:
+        return (
+            self._alive
+            and self._session is session
+            and not bool(session.get("destroyed"))
+        )
+
+    def _destroy_session(self, dismiss: bool) -> None:
+        session = self._session
+        if session is None:
+            return
+        self._session = None
+        session["destroyed"] = True
+        account = int(session.get("account", 0))
+        manager = ConnectionsManager.getInstance(account)
+        for request_id in list(session.get("requests", {}).keys()):
+            try:
+                manager.cancelRequest(int(request_id), True)
+            except Exception:
+                pass
+        session.get("requests", {}).clear()
+        loader = FileLoader.getInstance(account)
+        for attach, ext in list(session.get("downloads", [])):
+            try:
+                if self._class_name(attach).startswith("TL_videoSize"):
+                    loader.cancelLoadFile(getattr(attach, "location", None), str(ext))
+                else:
+                    loader.cancelLoadFile(attach)
+            except Exception:
+                pass
+        for path in list(session.get("uploads", [])):
+            try:
+                loader.cancelFileUpload(str(path), False)
+            except Exception:
+                pass
+        for waiter_key, waiter in list(self._file_waiters.items()):
+            if waiter[0] is session:
+                self._file_waiters.pop(waiter_key, None)
+        for waiter_key, waiter in list(self._upload_waiters.items()):
+            if waiter[0] is session:
+                self._upload_waiters.pop(waiter_key, None)
+        if dismiss:
+            try:
+                sheet = session.get("sheet")
+                if sheet is not None:
+                    sheet.dismiss()
+            except Exception:
+                pass
+        session.get("callbacks", []).clear()
+
+    def _send_request(
+        self,
+        session: Dict[str, Any],
+        request: Any,
+        callback: Callable[[Any, Any], None],
+    ) -> int:
+        if not self._valid_session(session):
+            return 0
+        request_id = [0]
+        settled = [False]
+
+        def deliver_once(response: Any, error: Any) -> None:
+            if settled[0] or not self._valid_session(session):
+                return
+            settled[0] = True
+            rid = int(request_id[0])
+            session["requests"].pop(rid, None)
+            task_done = session.get("active_done")
+            try:
+                callback(response, error)
+            except Exception as callback_error:
+                if callable(task_done):
+                    task_done(
+                        False,
+                        "Ошибка обработки ответа Telegram: "
+                        + str(callback_error),
+                    )
+
+        def received(response: Any, error: Any) -> None:
+            run_on_ui_thread(
+                lambda res=response, err=error: deliver_once(res, err)
+            )
+
+        wrapper = RequestCallback(received)
+        session["callbacks"].append(wrapper)
+        try:
+            rid = int(
+                ConnectionsManager.getInstance(
+                    int(session["account"])
+                ).sendRequest(
+                    request,
+                    wrapper,
+                    ConnectionsManager.RequestFlagDoNotWaitFloodWait,
+                )
+            )
+        except Exception as error:
+            run_on_ui_thread(
+                lambda err=error: deliver_once(None, err)
+            )
+            return 0
+        request_id[0] = rid
+        if not settled[0]:
+            session["requests"][rid] = request
+
+        def timed_out() -> None:
+            if settled[0] or not self._valid_session(session):
+                return
+            try:
+                ConnectionsManager.getInstance(
+                    int(session["account"])
+                ).cancelRequest(int(request_id[0]), True)
+            except Exception:
+                pass
+            deliver_once(
+                None,
+                RuntimeError(
+                    "Тайм-аут Telegram API: "
+                    + self._class_name(request)
+                ),
+            )
+
+        run_on_ui_thread(timed_out, delay=25000)
+        return rid
+
+    def _load_user(
+        self,
+        session: Dict[str, Any],
+        user: Any,
+        callback: Callable[[Any, Optional[str]], None],
+    ) -> None:
+        try:
+            controller = MessagesController.getInstance(int(session["account"]))
+            request = TLRPC.TL_users_getFullUser()
+            request.id = controller.getInputUser(user)
+        except Exception as error:
+            callback(None, str(error))
+            return
+
+        def received(response: Any, error: Any) -> None:
+            if error is not None:
+                callback(None, self._error_text(error))
+                return
+            full = getattr(response, "full_user", None)
+            if full is None:
+                callback(None, "Сервер не вернул полный профиль")
+                return
+            try:
+                controller.putUsers(response.users, False)
+                controller.putChats(response.chats, False)
+            except Exception:
+                pass
+            try:
+                full.user = controller.getUser(int(full.id))
+            except Exception:
+                full.user = user
+            callback(full, None)
+
+        self._send_request(session, request, received)
+
+
+    def _open_copy(self, context: Optional[Dict[str, Any]]) -> None:
+        context = context or {}
+        try:
+            user = context.get("user")
+            fragment = context.get("fragment")
+            account = context.get("account")
+            if account is None and fragment is not None:
+                account = fragment.getCurrentAccount()
+            account = int(account if account is not None else UserConfig.selectedAccount)
+            if user is None:
+                self._show_error("Не удалось определить пользователя")
+                return
+            if bool(getattr(user, "self", False)):
+                self._show_info("Откройте профиль другого пользователя")
+                return
+            if bool(getattr(user, "deleted", False)):
+                self._show_error("Удалённый профиль нельзя скопировать")
+                return
+            session = self._new_session(account, user, fragment, context)
+            self._show_info("Загружаю профиль…")
+
+            def loaded(full: Any, error: Optional[str]) -> None:
+                if not self._valid_session(session):
+                    return
+                if error is not None:
+                    self._show_error(f"Не удалось загрузить профиль: {error}")
+                    self._destroy_session(dismiss=False)
+                    return
+                session["source_full"] = full
+                if getattr(full, "user", None) is not None:
+                    session["source_user"] = full.user
+                self._show_copy(session)
+
+            self._load_user(session, user, loaded)
+        except Exception:
+            self._show_error("Не удалось открыть копирование профиля")
+
+    def _load_backup(self, backup: Dict[str, Any]) -> Tuple[Any, Any]:
+        status_data = backup.get("emoji_status")
+        if not isinstance(status_data, dict) or bool(status_data.get("empty")):
+            status = TLRPC.TL_emojiStatusEmpty()
+        else:
+            status = TLRPC.TL_emojiStatus()
+            status.document_id = int(
+                status_data.get("document_id", 0) or 0
+            )
+            until = int(status_data.get("until", 0) or 0)
+            if until > int(time.time()):
+                status.flags |= 1
+                status.until = until
+        user = SimpleNamespace(
+            id=int(backup.get("user_id", 0) or 0),
+            first_name=str(backup.get("first_name", "") or ""),
+            last_name=str(backup.get("last_name", "") or ""),
+            emoji_status=status,
+            color=self._load_color(backup.get("name_style")),
+            profile_color=self._load_color(
+                backup.get("profile_style")
+            ),
+        )
+
+        birthday_data = backup.get("birthday")
+        birthday = None
+        if isinstance(birthday_data, dict):
+            birthday = TL_account.TL_birthday()
+            birthday.flags = int(birthday_data.get("flags", 0) or 0)
+            birthday.day = int(birthday_data.get("day", 0) or 0)
+            birthday.month = int(birthday_data.get("month", 0) or 0)
+            birthday.year = int(birthday_data.get("year", 0) or 0)
+
+        tab = None
+        tab_name = str(backup.get("main_tab", "") or "")
+        tab_class = getattr(TLRPC, tab_name, None) if tab_name else None
+        if tab_class is not None:
+            try:
+                tab = tab_class()
+            except Exception:
+                tab = None
+
+        hours_data = backup.get("business_hours")
+        hours = None
+        if isinstance(hours_data, dict):
+            hours = SimpleNamespace(
+                timezone_id=str(hours_data.get("timezone_id", "") or ""),
+                weekly_open=[
+                    SimpleNamespace(
+                        start_minute=int(
+                            item.get("start_minute", 0) or 0
+                        ),
+                        end_minute=int(item.get("end_minute", 0) or 0),
+                    )
+                    for item in hours_data.get("weekly_open", [])
+                    if isinstance(item, dict)
+                ],
+            )
+
+        location_data = backup.get("business_location")
+        location = None
+        if isinstance(location_data, dict):
+            geo_data = location_data.get("geo")
+            geo = None
+            if isinstance(geo_data, dict):
+                geo = SimpleNamespace(
+                    lat=float(geo_data.get("lat", 0.0) or 0.0),
+                    _long=float(geo_data.get("long", 0.0) or 0.0),
+                )
+            location = SimpleNamespace(
+                address=str(location_data.get("address", "") or ""),
+                geo_point=geo,
+            )
+
+        intro_data = backup.get("business_intro")
+        intro = None
+        if isinstance(intro_data, dict):
+            sticker_data = intro_data.get("sticker")
+            intro = SimpleNamespace(
+                title=str(intro_data.get("title", "") or ""),
+                description=str(
+                    intro_data.get("description", "") or ""
+                ),
+                sticker=(
+                    self._load_document(sticker_data)
+                    if isinstance(sticker_data, dict)
+                    else None
+                ),
+            )
+        full = SimpleNamespace(
+            about=str(backup.get("about", "") or ""),
+            birthday=birthday,
+            profile_photo=None,
+            main_tab=tab,
+            business_work_hours=hours,
+            business_location=location,
+            business_intro=intro,
+        )
+        return user, full
+
+    def _open_restore(
+        self, context: Optional[Dict[str, Any]]
+    ) -> None:
+        context = context or {}
+        try:
+            fragment = context.get("fragment")
+            account = context.get("account")
+            if account is None and fragment is not None:
+                account = fragment.getCurrentAccount()
+            account = int(
+                account if account is not None else UserConfig.selectedAccount
+            )
+            raw_backup = self.get_setting(self._backup_key(account), "")
+            if isinstance(raw_backup, dict):
+                backup = raw_backup
+            else:
+                try:
+                    backup = json.loads(str(raw_backup or ""))
+                except Exception:
+                    backup = None
+            if not isinstance(backup, dict) or int(
+                backup.get("schema", 0) or 0
+            ) != 1:
+                self._show_info(
+                    "Резервной копии пока нет. Она будет создана автоматически, когда вы скопируете чей-то профиль."
+                )
+                return
+            current = UserConfig.getInstance(account).getCurrentUser()
+            if current is None:
+                self._show_error("Не найден текущий пользователь")
+                return
+            if int(backup.get("user_id", 0) or 0) != int(
+                getattr(current, "id", 0) or 0
+            ):
+                self._show_error(
+                    "Резервная копия относится к другому аккаунту"
+                )
+                return
+            source_user, source_full = self._load_backup(backup)
+            session = self._new_session(
+                account, source_user, fragment, context
+            )
+            session["source_full"] = source_full
+            session["backup"] = backup
+            session["restore_mode"] = True
+            fields = {
+                str(key) for key in backup.get("fields", [])
+                if str(key) in FIELD_ORDER
+            }
+            session["selected"] = {
+                key: key in fields for key in FIELD_ORDER
+            }
+            created_at = int(backup.get("created_at", 0) or 0)
+            date_text = (
+                time.strftime("%d.%m.%Y %H:%M", time.localtime(created_at))
+                if created_at > 0
+                else "неизвестно"
+            )
+            activity = session.get("activity")
+            provider = session.get("provider")
+            builder = (
+                AlertDialog.Builder(activity, provider)
+                if provider is not None
+                else AlertDialog.Builder(activity)
+            )
+            builder.setTitle("Восстановить профиль")
+            builder.setMessage(
+                f"Ваш профиль будет возвращён к состоянию на {date_text}. "
+                "Текущие изменения будут отменены."
+            )
+            builder.setNegativeButton("Отмена", None)
+            listener = _DialogButtonListener(
+                lambda: self._restore(session)
+            )
+            session["callbacks"].append(listener)
+            builder.setPositiveButton("Восстановить", listener)
+            builder.show()
+        except Exception:
+            self._show_error("Не удалось открыть восстановление профиля")
+
+    def _restore(self, session: Dict[str, Any]) -> None:
+        if not self._valid_session(session) or session.get("running"):
+            return
+        session["running"] = True
+        self._show_info("Подготавливаю восстановление профиля…")
+        target = UserConfig.getInstance(
+            int(session["account"])
+        ).getCurrentUser()
+        if target is None:
+            self._check_failed(session, "Не найден текущий пользователь")
+            return
+        session["target_user"] = target
+
+        def target_loaded(full: Any, error: Optional[str]) -> None:
+            if error is not None:
+                self._check_failed(
+                    session,
+                    f"Не удалось загрузить текущий профиль: {error}",
+                )
+                return
+            session["target_full"] = full
+            session["avatar_paths"] = {}
+            session["avatar_sizes"] = {}
+            session["running"] = False
+            self._copy(session)
+
+        self._load_user(session, target, target_loaded)
+
+    def _new_sheet(self, session: Dict[str, Any]) -> Any:
+        activity = session["activity"]
+        provider = session["provider"]
+        try:
+            sheet = BottomSheet(activity, False, provider)
+        except Exception:
+            sheet = BottomSheet(activity, False)
+        background = self._theme_color(
+            Theme.key_dialogBackground, provider, 0xFF1F1F1F
+        )
+        try:
+            call_int_color(sheet, "setBackgroundColor", background)
+        except Exception:
+            pass
+        try:
+            call_int_color(sheet, "fixNavigationBar", background)
+        except Exception:
+            pass
+        return sheet
+
+    def _text(
+        self,
+        context: Any,
+        provider: Any,
+        text: str,
+        size: float,
+        color_key: int,
+        fallback: int,
+        bold: bool = False,
+    ) -> Any:
+        view = TextView(context)
+        view.setText(str(text))
+        view.setTextSize(float(size))
+        if bold:
+            view.setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+        call_int_color(
+            view,
+            "setTextColor",
+            self._theme_color(color_key, provider, fallback),
+        )
+        return view
+
+    def _section(
+        self, context: Any, provider: Any, text: str
+    ) -> Any:
+        view = self._text(
+            context,
+            provider,
+            text,
+            14,
+            Theme.key_windowBackgroundWhiteBlueHeader,
+            0xFF3390EC,
+            True,
+        )
+        view.setPadding(self._dp(21), self._dp(13), self._dp(21), self._dp(7))
+        return view
+
+    def _header(self, session: Dict[str, Any]) -> Any:
+        context = session["activity"]
+        provider = session["provider"]
+        user = session["source_user"]
+        root = FrameLayout(context)
+        root.setPadding(self._dp(16), self._dp(12), self._dp(16), self._dp(8))
+
+        avatar = BackupImageView(context)
+        avatar.setRoundRadius(self._dp(30))
+        try:
+            avatar.setForUserOrChat(user, AvatarDrawable(user))
+        except Exception:
+            try:
+                drawable = AvatarDrawable()
+                drawable.setInfo(user)
+                avatar.setForUserOrChat(user, drawable)
+            except Exception:
+                pass
+        root.addView(
+            avatar,
+            LayoutHelper.createFrame(
+                60, 60, Gravity.LEFT | Gravity.CENTER_VERTICAL
+            ),
+        )
+
+        labels = LinearLayout(context)
+        labels.setOrientation(LinearLayout.VERTICAL)
+        labels.setGravity(Gravity.CENTER_VERTICAL)
+        root.addView(
+            labels,
+            LayoutHelper.createFrame(
+                -1,
+                68,
+                Gravity.LEFT | Gravity.CENTER_VERTICAL,
+                76,
+                0,
+                0,
+                0,
+            ),
+        )
+        full_name = " ".join(
+            part
+            for part in (
+                str(getattr(user, "first_name", "") or "").strip(),
+                str(getattr(user, "last_name", "") or "").strip(),
+            )
+            if part
+        ) or "Без имени"
+        title = self._text(
+            context,
+            provider,
+            full_name,
+            18,
+            Theme.key_dialogTextBlack,
+            0xFFFFFFFF,
+            True,
+        )
+        title.setSingleLine(True)
+        labels.addView(title, LayoutHelper.createLinear(-1, 28))
+        username = str(getattr(user, "username", "") or "")
+        subtitle_text = f"@{username}" if username else "Выберите, что скопировать"
+        subtitle = self._text(
+            context,
+            provider,
+            subtitle_text,
+            14,
+            Theme.key_windowBackgroundWhiteGrayText2,
+            0xFF999999,
+        )
+        subtitle.setSingleLine(True)
+        labels.addView(subtitle, LayoutHelper.createLinear(-1, 24))
+        return root
+
+    def _unavailable(self, session: Dict[str, Any]) -> Dict[str, str]:
+        unavailable: Dict[str, str] = {}
+        full = session.get("source_full")
+        user = session.get("source_user")
+        photo = getattr(full, "profile_photo", None) if full is not None else None
+        if photo is None or self._class_name(photo) == "TL_photoEmpty":
+            unavailable["avatar"] = "У пользователя нет фото профиля"
+        status = getattr(user, "emoji_status", None)
+        status_until = int(getattr(status, "until", 0) or 0)
+        if (
+            "Collectible" in self._class_name(status)
+            and (status_until <= 0 or status_until > int(time.time()))
+        ):
+            unavailable["emoji_status"] = (
+                "Этот статус уникальный, его нельзя скопировать"
+            )
+        if "Collectible" in self._class_name(getattr(user, "color", None)):
+            unavailable["name_style"] = (
+                "Этот цвет уникальный, его нельзя скопировать"
+            )
+        if "Collectible" in self._class_name(
+            getattr(user, "profile_color", None)
+        ):
+            unavailable["profile_style"] = (
+                "Этот цвет уникальный, его нельзя скопировать"
+            )
+        if getattr(full, "main_tab", None) is None:
+            unavailable["main_tab"] = "У пользователя не выбрана основная вкладка"
+        return unavailable
+
+    def _check_cell(
+        self,
+        session: Dict[str, Any],
+        key: str,
+        divider: bool,
+        enabled: bool,
+    ) -> Any:
+        context = session["activity"]
+        provider = session["provider"]
+        try:
+            row = TextCheckCell(context, provider)
+        except Exception:
+            row = TextCheckCell(context)
+        checked = bool(session["selected"].get(key, False)) and enabled
+        session["selected"][key] = checked
+        if enabled:
+            row.setTextAndCheck(FIELD_LABELS[key], checked, bool(divider))
+
+            def toggle() -> None:
+                value = not bool(session["selected"].get(key, False))
+                session["selected"][key] = value
+                try:
+                    row.setChecked(value)
+                except Exception:
+                    try:
+                        row.setChecked(value, True)
+                    except Exception:
+                        pass
+
+            listener = _ClickListener(toggle)
+            session["callbacks"].append(listener)
+            row.setOnClickListener(listener)
+        else:
+            reason = str(
+                session.get("unavailable", {}).get(
+                    key, "Недоступно для копирования"
+                )
+            )
+            row.setTextAndValueAndCheck(
+                FIELD_LABELS[key],
+                reason,
+                False,
+                True,
+                bool(divider),
+            )
+            try:
+                row.setEnabled(False, None)
+            except Exception:
+                row.setEnabled(False)
+        session["rows"][key] = row
+        return row
+
+    def _show_copy(self, session: Dict[str, Any]) -> None:
+        if not self._valid_session(session):
+            return
+        context = session["activity"]
+        provider = session["provider"]
+        if context is None:
+            self._show_error("Нет активного окна")
+            self._destroy_session(dismiss=False)
+            return
+        initial_unavailable = self._unavailable(session)
+        session["unavailable"] = dict(initial_unavailable)
+        sheet = self._new_sheet(session)
+        session["sheet"] = sheet
+
+        root = LinearLayout(context)
+        root.setOrientation(LinearLayout.VERTICAL)
+        background = self._theme_color(
+            Theme.key_dialogBackground, provider, 0xFF1F1F1F
+        )
+        call_int_color(root, "setBackgroundColor", background)
+
+        scroll = ScrollView(context)
+        scroll.setFillViewport(False)
+        scroll.setVerticalScrollBarEnabled(False)
+        content = LinearLayout(context)
+        content.setOrientation(LinearLayout.VERTICAL)
+        content.addView(
+            self._header(session), LayoutHelper.createLinear(-1, 88)
+        )
+
+        content.addView(
+            self._section(context, provider, "ОСНОВНОЕ"),
+            LayoutHelper.createLinear(-1, -2),
+        )
+        base_keys = (
+            "first_name",
+            "last_name",
+            "bio",
+            "avatar",
+            "birthday",
+            "emoji_status",
+        )
+        for index, key in enumerate(base_keys):
+            content.addView(
+                self._check_cell(
+                    session,
+                    key,
+                    index < len(base_keys) - 1,
+                    key not in initial_unavailable,
+                ),
+                LayoutHelper.createLinear(-1, -2),
+            )
+
+        content.addView(
+            self._section(context, provider, "ОФОРМЛЕНИЕ"),
+            LayoutHelper.createLinear(-1, -2),
+        )
+        style_keys = ("name_style", "profile_style", "main_tab")
+        for index, key in enumerate(style_keys):
+            content.addView(
+                self._check_cell(
+                    session,
+                    key,
+                    index < len(style_keys) - 1,
+                    key not in initial_unavailable,
+                ),
+                LayoutHelper.createLinear(-1, -2),
+            )
+
+        content.addView(
+            self._section(context, provider, "TELEGRAM BUSINESS"),
+            LayoutHelper.createLinear(-1, -2),
+        )
+        business_keys = (
+            "business_hours",
+            "business_location",
+            "business_intro",
+        )
+        for index, key in enumerate(business_keys):
+            content.addView(
+                self._check_cell(
+                    session, key, index < len(business_keys) - 1, True
+                ),
+                LayoutHelper.createLinear(-1, -2),
+            )
+
+        scroll.addView(content, LayoutHelper.createScroll(-1, -2, Gravity.TOP))
+        try:
+            visible_height = int(AndroidUtilities.displaySize.y * 0.70)
+        except Exception:
+            visible_height = self._dp(520)
+        visible_height = max(
+            self._dp(320), min(self._dp(560), visible_height)
+        )
+        button_height = self._dp(72)
+        scroll_height = max(self._dp(248), visible_height - button_height)
+        root.addView(
+            scroll, LinearLayout.LayoutParams(-1, scroll_height)
+        )
+
+        button_wrap = FrameLayout(context)
+        button_wrap.setPadding(
+            self._dp(12), self._dp(8), self._dp(12), self._dp(12)
+        )
+        try:
+            button = ButtonWithCounterView(context, True, provider)
+        except Exception:
+            button = ButtonWithCounterView(context, provider)
+        button.setText("Проверить и скопировать", False)
+        click = _ClickListener(lambda: self._check_copy(session))
+        session["callbacks"].append(click)
+        button.setOnClickListener(click)
+        button_wrap.addView(button, LayoutHelper.createFrame(-1, 52))
+        root.addView(button_wrap, LayoutHelper.createLinear(-1, 72))
+        session["button"] = button
+
+        def dismissed() -> None:
+            if self._session is session:
+                self._destroy_session(dismiss=False)
+
+        dismiss_listener = _DismissListener(dismissed)
+        session["callbacks"].append(dismiss_listener)
+        try:
+            sheet.setOnDismissListener(dismiss_listener)
+        except Exception:
+            pass
+        sheet.setCustomView(root)
+        sheet.show()
+
+    def _set_loading(self, session: Dict[str, Any], loading: bool) -> None:
+        button = session.get("button")
+        if button is None:
+            return
+        try:
+            button.setLoading(bool(loading))
+        except Exception:
+            pass
+        try:
+            button.setEnabled(not bool(loading))
+        except Exception:
+            pass
+
+    def _check_copy(self, session: Dict[str, Any]) -> None:
+        if (
+            not self._valid_session(session)
+            or session.get("running")
+            or session.get("completed")
+        ):
+            return
+        selected = [
+            key for key in FIELD_ORDER if session["selected"].get(key, False)
+        ]
+        if not selected:
+            self._show_info("Выберите хотя бы одно поле")
+            return
+        session["running"] = True
+        session["results"] = []
+        session["unavailable"] = self._unavailable(session)
+        session["avatar_paths"] = {}
+        session["avatar_sizes"] = {}
+        self._set_loading(session, True)
+        try:
+            session["sheet"].setCanDismissWithSwipe(False)
+        except Exception:
+            pass
+        account = int(session["account"])
+        target = UserConfig.getInstance(account).getCurrentUser()
+        if target is None:
+            self._check_failed(session, "Не найден текущий пользователь")
+            return
+        session["target_user"] = target
+
+        def target_loaded(full: Any, error: Optional[str]) -> None:
+            if error is not None:
+                self._check_failed(
+                    session, f"Не удалось загрузить ваш профиль: {error}"
+                )
+                return
+            session["target_full"] = full
+            if getattr(full, "user", None) is not None:
+                session["target_user"] = full.user
+            self._validate(session)
+            self._prepare_avatar(session)
+
+        self._load_user(session, target, target_loaded)
+
+    def _validate(self, session: Dict[str, Any]) -> None:
+        selected = session["selected"]
+        unavailable = session["unavailable"]
+        source = session["source_user"]
+        source_full = session["source_full"]
+        account = int(session["account"])
+        user_config = UserConfig.getInstance(account)
+        controller = MessagesController.getInstance(account)
+        premium = bool(user_config.isPremium())
+
+        first_name = str(getattr(source, "first_name", "") or "")
+        last_name = str(getattr(source, "last_name", "") or "")
+        about = str(getattr(source_full, "about", "") or "")
+        if selected.get("first_name") and (
+            not first_name.strip() or len(first_name) > 64
+        ):
+            unavailable["first_name"] = "Имя пустое или слишком длинное"
+        if selected.get("last_name") and len(last_name) > 64:
+            unavailable["last_name"] = "Фамилия слишком длинная"
+        about_limit = int(
+            getattr(
+                controller,
+                "aboutLengthLimitPremium"
+                if premium
+                else "aboutLengthLimitDefault",
+                140 if not premium else 280,
+            )
+            or (140 if not premium else 280)
+        )
+        if selected.get("bio") and len(about) > about_limit:
+            unavailable["bio"] = (
+                f"Текст «О себе» слишком длинный для вашего аккаунта"
+            )
+        source_photo = getattr(source_full, "profile_photo", None)
+        avatar_markup = any(
+            "Markup" in self._class_name(item)
+            for item in self._to_list(
+                getattr(source_photo, "video_sizes", None)
+            )
+        )
+        if selected.get("avatar") and avatar_markup and not premium:
+            unavailable["avatar"] = (
+                "Чтобы установить такой аватар, нужна подписка Telegram Premium"
+            )
+
+        status = getattr(source, "emoji_status", None)
+        status_until = int(getattr(status, "until", 0) or 0)
+        status_active = (
+            status is not None
+            and self._class_name(status) != "TL_emojiStatusEmpty"
+            and (status_until <= 0 or status_until > int(time.time()))
+        )
+        if (
+            selected.get("emoji_status")
+            and status_active
+            and not premium
+        ):
+            unavailable["emoji_status"] = "Чтобы установить эмодзи-статус, нужна подписка Telegram Premium"
+        for key, value in (
+            ("name_style", getattr(source, "color", None)),
+            ("profile_style", getattr(source, "profile_color", None)),
+        ):
+            if (
+                selected.get(key)
+                and value is not None
+                and self._class_name(value) != "TL_peerColor"
+            ):
+                unavailable[key] = (
+                    "Этот цвет уникальный, его нельзя скопировать"
+                )
+            elif (
+                selected.get(key)
+                and value is not None
+                and int(getattr(value, "flags", 0) or 0) & 3
+                and not premium
+            ):
+                unavailable[key] = "Чтобы установить такой цвет, нужна подписка Telegram Premium"
+
+        business_values = (
+            getattr(source_full, "business_work_hours", None),
+            getattr(source_full, "business_location", None),
+            getattr(source_full, "business_intro", None),
+        )
+        if not premium:
+            for key, value in zip(
+                (
+                    "business_hours",
+                    "business_location",
+                    "business_intro",
+                ),
+                business_values,
+            ):
+                if selected.get(key) and value is not None:
+                    unavailable[key] = "Для этой функции нужна подписка Telegram Premium"
+
+        location = getattr(source_full, "business_location", None)
+        if selected.get("business_location") and location is not None:
+            address = str(getattr(location, "address", "") or "").strip()
+            if not address:
+                unavailable["business_location"] = (
+                    "У пользователя не указан адрес"
+                )
+            elif len(address) > 96:
+                unavailable["business_location"] = (
+                    "Адрес слишком длинный"
+                )
+        intro = getattr(source_full, "business_intro", None)
+        if selected.get("business_intro") and intro is not None:
+            title_limit = int(
+                getattr(controller, "introTitleLengthLimit", 32) or 32
+            )
+            description_limit = int(
+                getattr(controller, "introDescriptionLengthLimit", 70) or 70
+            )
+            if len(str(getattr(intro, "title", "") or "")) > title_limit:
+                unavailable["business_intro"] = (
+                    f"Заголовок приветствия слишком длинный"
+                )
+            elif (
+                len(str(getattr(intro, "description", "") or ""))
+                > description_limit
+            ):
+                unavailable["business_intro"] = (
+                    f"Текст приветствия слишком длинный"
+                )
+
+    def _watch_files(self, account: int) -> None:
+        if int(account) in self._file_delegates:
+            return
+        delegate = _FileEvents(self, int(account))
+        center = NotificationCenter.getInstance(int(account))
+        center.addObserver(delegate, NotificationCenter.fileLoaded)
+        center.addObserver(delegate, NotificationCenter.fileLoadFailed)
+        center.addObserver(delegate, NotificationCenter.fileUploaded)
+        center.addObserver(delegate, NotificationCenter.fileUploadFailed)
+        self._file_delegates[int(account)] = delegate
+
+    def _file_event(self, event_id: int, account: int, args: Any) -> None:
+        try:
+            key = str(args[0])
+        except Exception:
+            return
+        if int(event_id) in (
+            int(NotificationCenter.fileUploaded),
+            int(NotificationCenter.fileUploadFailed),
+        ):
+            waiter = self._upload_waiters.pop(
+                (int(account), key), None
+            )
+            if waiter is None:
+                return
+            session, callback = waiter
+            if not self._valid_session(session):
+                return
+            try:
+                session["uploads"].remove(key)
+            except Exception:
+                pass
+            if int(event_id) == int(NotificationCenter.fileUploaded):
+                input_file = args[1] if len(args) > 1 else None
+                run_on_ui_thread(lambda: callback(input_file, None))
+            else:
+                run_on_ui_thread(
+                    lambda: callback(None, "Ошибка загрузки файла")
+                )
+            return
+        if int(event_id) not in (
+            int(NotificationCenter.fileLoaded),
+            int(NotificationCenter.fileLoadFailed),
+        ):
+            return
+        waiter = self._file_waiters.pop((int(account), key), None)
+        if waiter is None:
+            return
+        session, callback = waiter
+        if not self._valid_session(session):
+            return
+        if int(event_id) == int(NotificationCenter.fileLoaded):
+            file_value = args[1] if len(args) > 1 else None
+            run_on_ui_thread(lambda: callback(True, file_value))
+        else:
+            run_on_ui_thread(lambda: callback(False, None))
+
+    def _download(
+        self,
+        session: Dict[str, Any],
+        attach: Any,
+        photo: Any,
+        ext: str,
+        callback: Callable[[Optional[str], Optional[str]], None],
+    ) -> None:
+        account = int(session["account"])
+        loader = FileLoader.getInstance(account)
+        try:
+            path_file = loader.getPathToAttach(attach, str(ext), True)
+            path = str(path_file.getAbsolutePath())
+            if bool(path_file.exists()) and int(path_file.length()) > 0:
+                callback(path, None)
+                return
+            key = str(FileLoader.getAttachFileName(attach, str(ext)))
+            if not key:
+                callback(None, "Не удалось определить имя файла")
+                return
+            image_location = ImageLocation.getForPhoto(attach, photo)
+            if image_location is None:
+                callback(None, "Не удалось определить расположение файла")
+                return
+            self._watch_files(account)
+
+            def finished(success: bool, loaded_file: Any) -> None:
+                if not self._valid_session(session):
+                    return
+                if not success:
+                    callback(None, "Telegram не загрузил файл")
+                    return
+                try:
+                    actual = (
+                        str(loaded_file.getAbsolutePath())
+                        if loaded_file is not None
+                        else path
+                    )
+                except Exception:
+                    actual = path
+                callback(actual, None)
+
+            self._file_waiters[(account, key)] = (session, finished)
+            session["downloads"].append((attach, ext))
+            priority = int(
+                getattr(
+                    FileLoader,
+                    "PRIORITY_HIGH",
+                    getattr(FileLoader, "PRIORITY_NORMAL_UP", 3),
+                )
+            )
+            loader.loadFile(image_location, photo, str(ext), priority, 1)
+
+            def timed_out() -> None:
+                waiter = self._file_waiters.get((account, key))
+                if (
+                    waiter is None
+                    or waiter[0] is not session
+                    or not self._valid_session(session)
+                ):
+                    return
+                self._file_waiters.pop((account, key), None)
+                try:
+                    if self._class_name(attach).startswith("TL_videoSize"):
+                        loader.cancelLoadFile(
+                            getattr(attach, "location", None), str(ext)
+                        )
+                    else:
+                        loader.cancelLoadFile(attach)
+                except Exception:
+                    pass
+                callback(None, "Тайм-аут загрузки файла аватара")
+
+            run_on_ui_thread(timed_out, delay=60000)
+        except Exception as error:
+            callback(None, str(error))
+
+    def _prepare_avatar(self, session: Dict[str, Any]) -> None:
+        if (
+            not session["selected"].get("avatar")
+            or "avatar" in session["unavailable"]
+        ):
+            self._finish_check(session)
+            return
+        photo = getattr(session["source_full"], "profile_photo", None)
+        try:
+            photo_size = FileLoader.getClosestPhotoSizeWithSize(
+                getattr(photo, "sizes", None), 1280
+            )
+        except Exception:
+            photo_size = None
+        if photo_size is None:
+            session["unavailable"]["avatar"] = (
+                "У аватара нет доступной статичной обложки"
+            )
+            self._finish_check(session)
+            return
+        session["avatar_sizes"]["photo"] = photo_size
+
+        def photo_ready(path: Optional[str], error: Optional[str]) -> None:
+            if error is not None or not path:
+                session["unavailable"]["avatar"] = (
+                    f"Не удалось подготовить аватар: {error or 'нет файла'}"
+                )
+                self._finish_check(session)
+                return
+            session["avatar_paths"]["photo"] = path
+            video_sizes = self._to_list(getattr(photo, "video_sizes", None))
+            if not video_sizes:
+                self._finish_check(session)
+                return
+            markup = next(
+                (
+                    item
+                    for item in video_sizes
+                    if "EmojiMarkup" in self._class_name(item)
+                    or "StickerMarkup" in self._class_name(item)
+                ),
+                None,
+            )
+            if markup is not None:
+                session["avatar_sizes"]["markup"] = markup
+            try:
+                video_size = FileLoader.getClosestVideoSizeWithSize(
+                    getattr(photo, "video_sizes", None), 1000
+                )
+            except Exception:
+                video_size = next(
+                    (
+                        item
+                        for item in reversed(video_sizes)
+                        if "Markup" not in self._class_name(item)
+                    ),
+                    None,
+                )
+            if video_size is None:
+                if markup is None:
+                    session["unavailable"]["avatar"] = (
+                        "У видеоаватара нет доступного видео"
+                    )
+                self._finish_check(session)
+                return
+            session["avatar_sizes"]["video"] = video_size
+
+            def video_ready(
+                video_path: Optional[str], video_error: Optional[str]
+            ) -> None:
+                if video_error is not None or not video_path:
+                    session["unavailable"]["avatar"] = (
+                        "Не удалось подготовить видеоаватар: "
+                        f"{video_error or 'нет файла'}"
+                    )
+                else:
+                    session["avatar_paths"]["video"] = video_path
+                self._finish_check(session)
+
+            self._download(
+                session, video_size, photo, "mp4", video_ready
+            )
+
+        self._download(
+            session, photo_size, photo, "jpg", photo_ready
+        )
+
+    def _finish_check(self, session: Dict[str, Any]) -> None:
+        if not self._valid_session(session):
+            return
+        if session["selected"].get("main_tab"):
+            tab_name = self._class_name(
+                getattr(session["source_full"], "main_tab", None)
+            )
+            target_full = session.get("target_full")
+            if tab_name == "TL_profileTabGifts" and int(
+                getattr(target_full, "stargifts_count", 0) or 0
+            ) <= 0:
+                session["unavailable"]["main_tab"] = (
+                    "В вашем профиле еще нет подарков"
+                )
+        session["running"] = False
+        self._set_loading(session, False)
+        try:
+            session["sheet"].setCanDismissWithSwipe(True)
+        except Exception:
+            pass
+        selected = [
+            key for key in FIELD_ORDER if session["selected"].get(key)
+        ]
+        available = [
+            key for key in selected if key not in session["unavailable"]
+        ]
+        if not available:
+            self._show_check(session, selected, available)
+            return
+        self._show_check(session, selected, available)
+
+    def _check_failed(
+        self, session: Dict[str, Any], message: str
+    ) -> None:
+        if not self._valid_session(session):
+            return
+        session["running"] = False
+        self._set_loading(session, False)
+        try:
+            session["sheet"].setCanDismissWithSwipe(True)
+        except Exception:
+            pass
+        self._show_error(message)
+
+    def _show_check(
+        self,
+        session: Dict[str, Any],
+        selected: Sequence[str],
+        available: Sequence[str],
+    ) -> None:
+        context = session["activity"]
+        provider = session["provider"]
+        unavailable = session["unavailable"]
+        lines = [
+            "Источник: "
+            + " ".join(
+                part
+                for part in (
+                    str(
+                        getattr(
+                            session["source_user"], "first_name", ""
+                        )
+                        or ""
+                    ).strip(),
+                    str(
+                        getattr(
+                            session["source_user"], "last_name", ""
+                        )
+                        or ""
+                    ).strip(),
+                )
+                if part
+            ),
+            "",
+            "Будут изменены: "
+            + (
+                ", ".join(FIELD_LABELS[key] for key in available)
+                if available
+                else "ничего"
+            ),
+        ]
+        blocked = [key for key in selected if key in unavailable]
+        if blocked:
+            lines.extend(
+                [
+                    "",
+                    "Недоступно:",
+                    *[
+                        f"• {FIELD_LABELS[key]} — {unavailable[key]}"
+                        for key in blocked
+                    ],
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Ваши текущие данные будут сохранены.",
+                "Вы сможете вернуть всё как было через меню своего профиля.",
+            ]
+        )
+        try:
+            builder = (
+                AlertDialog.Builder(context, provider)
+                if provider is not None
+                else AlertDialog.Builder(context)
+            )
+            builder.setTitle("Проверка завершена")
+            builder.setMessage("\n".join(lines))
+            builder.setNegativeButton("Отмена", None)
+            if available:
+                listener = _DialogButtonListener(
+                    lambda: self._copy(session)
+                )
+                session["callbacks"].append(listener)
+                button_text = (
+                    "Скопировать доступное" if blocked else "Скопировать"
+                )
+                builder.setPositiveButton(button_text, listener)
+            builder.show()
+        except Exception as error:
+            self._check_failed(
+                session, f"Не удалось показать подтверждение: {error}"
+            )
+
+
+    def _copy(self, session: Dict[str, Any]) -> None:
+        if not self._valid_session(session) or session.get("running"):
+            return
+        if not session.get("restore_mode"):
+            try:
+                if not self._save_backup(session):
+                    self._show_error("Не удалось создать резервную копию профиля")
+                    return
+            except Exception:
+                self._show_error(
+                    "Копирование отменено: не удалось сохранить ваш профиль"
+                )
+                return
+        session["running"] = True
+        session["results"] = []
+        for key in FIELD_ORDER:
+            if (
+                session["selected"].get(key)
+                and key in session["unavailable"]
+            ):
+                session["results"].append(
+                    (
+                        key,
+                        "skipped",
+                        session["unavailable"][key],
+                    )
+                )
+        self._set_loading(session, True)
+        try:
+            sheet = session.get("sheet")
+            if sheet is not None:
+                try:
+                    sheet.setCanDismissWithSwipe(False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        tasks = self._get_tasks(session)
+        self._run_tasks(session, tasks, 0)
+
+    def _get_tasks(
+        self, session: Dict[str, Any]
+    ) -> List[Tuple[List[str], Callable[[Callable[[bool, str], None]], None]]]:
+        selected = session["selected"]
+        unavailable = session["unavailable"]
+
+        def allowed(key: str) -> bool:
+            return bool(selected.get(key)) and key not in unavailable
+
+        tasks = []
+        profile_keys = [
+            key
+            for key in ("first_name", "last_name", "bio")
+            if allowed(key)
+        ]
+        if profile_keys:
+            tasks.append(
+                (profile_keys, lambda done: self._profile(session, profile_keys, done))
+            )
+        mapping = (
+            ("birthday", self._birthday),
+            ("emoji_status", self._emoji_status),
+            ("name_style", self._name_style),
+            ("profile_style", self._profile_style),
+            ("avatar", self._avatar),
+            ("main_tab", self._main_tab),
+            ("business_hours", self._business_hours),
+            ("business_location", self._business_location),
+            ("business_intro", self._business_intro),
+        )
+        for key, method in mapping:
+            if allowed(key):
+                tasks.append(
+                    ([key], lambda done, fn=method: fn(session, done))
+                )
+        return tasks
+
+    def _run_tasks(
+        self,
+        session: Dict[str, Any],
+        tasks: Sequence[
+            Tuple[List[str], Callable[[Callable[[bool, str], None]], None]]
+        ],
+        index: int,
+    ) -> None:
+        if not self._valid_session(session):
+            return
+        if index >= len(tasks):
+            self._finish(session)
+            return
+        keys, operation = tasks[index]
+        task_token = time.time_ns()
+        session["active_task"] = task_token
+        completed = [False]
+        label = ", ".join(FIELD_LABELS.get(key, key) for key in keys)
+        button = session.get("button")
+        if button is not None:
+            try:
+                button.setText(f"Копирование: {label}", False)
+            except Exception:
+                pass
+
+        def done(success: bool, error: str = "") -> None:
+            if (
+                completed[0]
+                or not self._valid_session(session)
+                or session.get("active_task") != task_token
+            ):
+                return
+            completed[0] = True
+            if session.get("active_done") is done:
+                session["active_done"] = None
+            for key in keys:
+                session["results"].append(
+                    (
+                        key,
+                        "success" if success else "failed",
+                        "" if success else str(error or "Неизвестная ошибка"),
+                    )
+                )
+            self._run_tasks(session, tasks, index + 1)
+
+        def timed_out() -> None:
+            if (
+                completed[0]
+                or not self._valid_session(session)
+                or session.get("active_task") != task_token
+            ):
+                return
+            done(False, f"Операция «{label}» не завершилась за 75 секунд")
+
+        session["active_done"] = done
+        try:
+            operation(done)
+        except Exception as error:
+            done(False, str(error))
+            return
+        run_on_ui_thread(timed_out, delay=75000)
+
+    def _profile(
+        self,
+        session: Dict[str, Any],
+        keys: Sequence[str],
+        done: Callable[[bool, str], None],
+    ) -> None:
+        request = TL_account.updateProfile()
+        source = session["source_user"]
+        full = session["source_full"]
+        if "first_name" in keys:
+            request.flags |= 1
+            request.first_name = str(getattr(source, "first_name", "") or "")
+        if "last_name" in keys:
+            request.flags |= 2
+            request.last_name = str(getattr(source, "last_name", "") or "")
+        if "bio" in keys:
+            request.flags |= 4
+            request.about = str(getattr(full, "about", "") or "")
+
+        def received(response: Any, error: Any) -> None:
+            if error is not None:
+                done(False, self._error_text(error))
+            else:
+                done(True, "")
+
+        self._send_request(session, request, received)
+
+    def _birthday(
+        self, session: Dict[str, Any], done: Callable[[bool, str], None]
+    ) -> None:
+        request = TL_account.updateBirthday()
+        birthday = getattr(session["source_full"], "birthday", None)
+        copy = None
+        if birthday is not None:
+            copy = TL_account.TL_birthday()
+            copy.flags = int(getattr(birthday, "flags", 0) or 0)
+            copy.day = int(getattr(birthday, "day", 0) or 0)
+            copy.month = int(getattr(birthday, "month", 0) or 0)
+            copy.year = int(getattr(birthday, "year", 0) or 0)
+            request.flags |= 1
+            request.birthday = copy
+
+        def received(response: Any, error: Any) -> None:
+            if error is not None:
+                done(False, self._error_text(error))
+            elif self._is_false(response):
+                done(False, "Сервер отклонил изменение")
+            else:
+                try:
+                    self._cache_user_full_field(
+                        session, "birthday", copy, 32
+                    )
+                    MessagesController.getInstance(
+                        int(session["account"])
+                    ).invalidateContentSettings()
+                except Exception:
+                    pass
+                done(True, "")
+
+        self._send_request(session, request, received)
+
+    def _emoji_status(
+        self, session: Dict[str, Any], done: Callable[[bool, str], None]
+    ) -> None:
+        request = TL_account.updateEmojiStatus()
+        source = getattr(session["source_user"], "emoji_status", None)
+        name = self._class_name(source)
+        source_until = int(getattr(source, "until", 0) or 0)
+        if (
+            source is None
+            or name == "TL_emojiStatusEmpty"
+            or (source_until > 0 and source_until <= int(time.time()))
+        ):
+            request.emoji_status = TLRPC.TL_emojiStatusEmpty()
+        else:
+            status = TLRPC.TL_emojiStatus()
+            status.document_id = int(getattr(source, "document_id", 0) or 0)
+            until = source_until
+            if until > int(time.time()):
+                status.flags |= 1
+                status.until = until
+            request.emoji_status = status
+        self._simple(session, request, done)
+
+    def _color_req(self, source: Any, for_profile: bool) -> Any:
+        request = TL_account.updateColor()
+        request.for_profile = bool(for_profile)
+        if source is None:
+            return request
+        color = TLRPC.TL_peerColor()
+        flags = int(getattr(source, "flags", 0) or 0)
+        if flags & 1 and int(getattr(source, "color", -1)) >= 0:
+            color.flags |= 1
+            color.color = int(source.color)
+        if flags & 2 and int(
+            getattr(source, "background_emoji_id", 0) or 0
+        ):
+            color.flags |= 2
+            color.background_emoji_id = int(source.background_emoji_id)
+            request.flags |= 1
+        if color.flags:
+            request.flags |= 4
+            request.color = color
+        return request
+
+    def _name_style(
+        self, session: Dict[str, Any], done: Callable[[bool, str], None]
+    ) -> None:
+        request = self._color_req(
+            getattr(session["source_user"], "color", None), False
+        )
+        self._simple(session, request, done)
+
+    def _profile_style(
+        self, session: Dict[str, Any], done: Callable[[bool, str], None]
+    ) -> None:
+        request = self._color_req(
+            getattr(session["source_user"], "profile_color", None), True
+        )
+        self._simple(session, request, done)
+
+    def _upload(
+        self,
+        session: Dict[str, Any],
+        path: str,
+        file_type: int,
+        callback: Callable[[Any, Optional[str]], None],
+    ) -> None:
+        account = int(session["account"])
+        upload_path = str(path)
+        completed = [False]
+        session["uploads"].append(upload_path)
+
+        def finish(input_file: Any, error: Optional[str]) -> None:
+            if completed[0] or not self._valid_session(session):
+                return
+            completed[0] = True
+            try:
+                session["uploads"].remove(upload_path)
+            except Exception:
+                pass
+            callback(input_file, error)
+
+        def uploaded(input_file: Any) -> None:
+            run_on_ui_thread(
+                lambda value=input_file: finish(
+                    value,
+                    None if value is not None else "Telegram отклонил загрузку файла",
+                )
+            )
+
+        upload_callback = _UtilitiesCallback(uploaded)
+        session["callbacks"].append(upload_callback)
+        try:
+            FileLoader.getInstance(account).uploadFile(
+                upload_path, upload_callback
+            )
+
+            def timed_out() -> None:
+                if (
+                    completed[0]
+                    or not self._valid_session(session)
+                ):
+                    return
+                try:
+                    FileLoader.getInstance(account).cancelFileUpload(
+                        upload_path, False
+                    )
+                except Exception:
+                    pass
+                finish(None, "Тайм-аут загрузки аватара на сервер")
+
+            run_on_ui_thread(timed_out, delay=60000)
+        except Exception as error:
+            finish(None, str(error))
+
+    def _avatar(
+        self, session: Dict[str, Any], done: Callable[[bool, str], None]
+    ) -> None:
+        if session.get("restore_mode"):
+            self._restore_avatar(session, done)
+            return
+        photo_path = session["avatar_paths"].get("photo")
+        video_path = session["avatar_paths"].get("video")
+        if not photo_path:
+            done(False, "Обложка аватара не подготовлена")
+            return
+
+        def photo_uploaded(
+            photo_file: Any, photo_error: Optional[str]
+        ) -> None:
+            if photo_error is not None or photo_file is None:
+                done(False, photo_error or "Не удалось загрузить фото")
+                return
+            if not video_path:
+                self._send_avatar(
+                    session, photo_file, None, 0.0, done
+                )
+                return
+
+            def video_uploaded(
+                video_file: Any, video_error: Optional[str]
+            ) -> None:
+                if video_error is not None or video_file is None:
+                    done(False, video_error or "Не удалось загрузить видео")
+                    return
+                video_size = session["avatar_sizes"].get("video")
+                start = float(
+                    getattr(video_size, "video_start_ts", 0.0) or 0.0
+                )
+                self._send_avatar(
+                    session, photo_file, video_file, start, done
+                )
+
+            self._upload(
+                session,
+                video_path,
+                ConnectionsManager.FileTypeVideo,
+                video_uploaded,
+            )
+
+        self._upload(
+            session,
+            photo_path,
+            ConnectionsManager.FileTypePhoto,
+            photo_uploaded,
+        )
+
+    def _input_photo(self, data: Dict[str, Any]) -> Any:
+        photo = TLRPC.TL_inputPhoto()
+        photo.id = int(data.get("id", 0) or 0)
+        photo.access_hash = int(data.get("access_hash", 0) or 0)
+        photo.file_reference = self._decode_bytes(
+            data.get("file_reference")
+        )
+        return photo
+
+    def _restore_avatar(
+        self, session: Dict[str, Any], done: Callable[[bool, str], None]
+    ) -> None:
+        avatar = session.get("backup", {}).get("avatar")
+        if isinstance(avatar, dict) and int(avatar.get("id", 0) or 0):
+            self._restore_photo(session, avatar, done)
+            return
+        current = getattr(session.get("target_full"), "profile_photo", None)
+        if current is None or self._class_name(current) == "TL_photoEmpty":
+            done(True, "")
+            return
+        current_data = self._save_photo(current)
+        if current_data is None:
+            done(False, "Не удалось определить текущий аватар")
+            return
+        request = TLRPC.TL_photos_deletePhotos()
+        request.id.add(self._input_photo(current_data))
+        self._simple(session, request, done)
+
+    def _restore_photo(
+        self,
+        session: Dict[str, Any],
+        avatar: Dict[str, Any],
+        done: Callable[[bool, str], None],
+        refreshed: bool = False,
+    ) -> None:
+        request = TLRPC.TL_photos_updateProfilePhoto()
+        request.id = self._input_photo(avatar)
+
+        def received(response: Any, error: Any) -> None:
+            if error is None:
+                done(True, "")
+                return
+            error_text = self._error_text(error)
+            if refreshed or "FILE_REFERENCE" not in error_text.upper():
+                done(False, error_text)
+                return
+            refresh = TLRPC.TL_photos_getUserPhotos()
+            refresh.user_id = MessagesController.getInstance(
+                int(session["account"])
+            ).getInputUser(session["target_user"])
+            refresh.offset = 0
+            refresh.max_id = 0
+            refresh.limit = 100
+
+            def photos_loaded(photos: Any, photos_error: Any) -> None:
+                if photos_error is not None:
+                    done(False, self._error_text(photos_error))
+                    return
+                wanted_id = int(avatar.get("id", 0) or 0)
+                fresh = next(
+                    (
+                        item
+                        for item in self._to_list(
+                            getattr(photos, "photos", None)
+                        )
+                        if int(getattr(item, "id", 0) or 0) == wanted_id
+                    ),
+                    None,
+                )
+                fresh_data = self._save_photo(fresh)
+                if fresh_data is None:
+                    done(
+                        False,
+                        "Сохранённый аватар больше недоступен в Telegram",
+                    )
+                    return
+                self._restore_photo(
+                    session, fresh_data, done, refreshed=True
+                )
+
+            self._send_request(session, refresh, photos_loaded)
+
+        self._send_request(session, request, received)
+
+    def _send_avatar(
+        self,
+        session: Dict[str, Any],
+        photo_file: Any,
+        video_file: Any,
+        video_start: float,
+        done: Callable[[bool, str], None],
+    ) -> None:
+        request = TLRPC.TL_photos_uploadProfilePhoto()
+        request.flags |= 1
+        request.file = photo_file
+        if video_file is not None:
+            request.flags |= 2
+            request.video = video_file
+            request.flags |= 4
+            request.video_start_ts = float(video_start)
+        markup = session["avatar_sizes"].get("markup")
+        if markup is not None:
+            request.flags |= 16
+            request.video_emoji_markup = markup
+        self._simple(session, request, done)
+
+    def _main_tab(
+        self, session: Dict[str, Any], done: Callable[[bool, str], None]
+    ) -> None:
+        tab = getattr(session["source_full"], "main_tab", None)
+        if tab is None:
+            done(False, "У источника не выбрана основная вкладка")
+            return
+        request = TLRPC.TL_account_setMainProfileTab()
+        request.tab = tab
+        self._simple(session, request, done)
+
+    def _business_hours(
+        self, session: Dict[str, Any], done: Callable[[bool, str], None]
+    ) -> None:
+        request = TL_account.updateBusinessWorkHours()
+        source = getattr(
+            session["source_full"], "business_work_hours", None
+        )
+        hours = None
+        if source is not None:
+            timezone_id = str(
+                getattr(source, "timezone_id", "") or ""
+            ).strip()
+            periods = self._to_list(
+                getattr(source, "weekly_open", None)
+            )
+            if timezone_id and periods:
+                hours = TL_account.TL_businessWorkHours()
+                hours.timezone_id = timezone_id
+            for period in periods if hours is not None else ():
+                copy = TL_account.TL_businessWeeklyOpen()
+                copy.start_minute = int(
+                    getattr(period, "start_minute", 0) or 0
+                )
+                copy.end_minute = int(
+                    getattr(period, "end_minute", 0) or 0
+                )
+                hours.weekly_open.add(copy)
+            if hours is not None:
+                request.flags |= 1
+                request.business_work_hours = hours
+
+        def received(response: Any, error: Any) -> None:
+            if error is not None:
+                done(False, self._error_text(error))
+                return
+            if self._is_false(response):
+                done(False, "Сервер отклонил изменение")
+                return
+            try:
+                self._cache_business_hours(session, hours)
+            except Exception:
+                pass
+            done(True, "")
+
+        self._send_request(session, request, received)
+
+    def _cache_user_full_field(
+        self,
+        session: Dict[str, Any],
+        field_name: str,
+        value: Any,
+        flag: int,
+    ) -> None:
+        try:
+            account = int(session["account"])
+            controller = MessagesController.getInstance(account)
+            current = UserConfig.getInstance(account).getCurrentUser()
+        except Exception:
+            return
+        user_id = int(getattr(current, "id", 0) or 0)
+        cached = None
+        if user_id:
+            try:
+                cached = controller.getUserFull(user_id)
+            except Exception:
+                pass
+        targets = []
+        for full in (session.get("target_full"), cached):
+            if full is not None and all(
+                full is not item for item in targets
+            ):
+                targets.append(full)
+        for full in targets:
+            try:
+                setattr(full, field_name, value)
+                flags2 = int(getattr(full, "flags2", 0) or 0)
+                full.flags2 = (
+                    flags2 | int(flag)
+                    if value is not None
+                    else flags2 & ~int(flag)
+                )
+            except Exception:
+                continue
+            try:
+                MessagesStorage.getInstance(account).updateUserInfo(
+                    full, False
+                )
+            except Exception:
+                pass
+
+    def _cache_business_hours(
+        self, session: Dict[str, Any], hours: Any
+    ) -> None:
+        self._cache_user_full_field(
+            session, "business_work_hours", hours, 1
+        )
+
+    def _business_location(
+        self, session: Dict[str, Any], done: Callable[[bool, str], None]
+    ) -> None:
+        request = TL_account.updateBusinessLocation()
+        source = getattr(session["source_full"], "business_location", None)
+        location = None
+        if source is not None:
+            address = str(getattr(source, "address", "") or "").strip()
+            geo = getattr(source, "geo_point", None)
+            if address:
+                request.flags |= 1
+                request.address = address
+                location = TLRPC.TL_businessLocation()
+                location.address = address
+            if (
+                location is not None
+                and geo is not None
+                and "Empty" not in self._class_name(geo)
+            ):
+                point = TLRPC.TL_inputGeoPoint()
+                point.lat = float(getattr(geo, "lat", 0.0) or 0.0)
+                point._long = float(getattr(geo, "_long", 0.0) or 0.0)
+                request.flags |= 2
+                request.geo_point = point
+                location.flags |= 1
+                location.geo_point = TLRPC.TL_geoPoint()
+                location.geo_point.lat = point.lat
+                location.geo_point._long = point._long
+
+        def received(response: Any, error: Any) -> None:
+            if error is not None:
+                done(False, self._error_text(error))
+            elif self._is_false(response):
+                done(False, "Сервер отклонил изменение")
+            else:
+                try:
+                    self._cache_user_full_field(
+                        session, "business_location", location, 2
+                    )
+                except Exception:
+                    pass
+                done(True, "")
+
+        self._send_request(session, request, received)
+
+    def _business_intro(
+        self, session: Dict[str, Any], done: Callable[[bool, str], None]
+    ) -> None:
+        request = TL_account.updateBusinessIntro()
+        source = getattr(session["source_full"], "business_intro", None)
+        cached_intro = None
+        if source is not None:
+            title = str(getattr(source, "title", "") or "")
+            description = str(
+                getattr(source, "description", "") or ""
+            )
+            sticker = getattr(source, "sticker", None)
+            input_sticker = self._input_document(sticker)
+            if title or description or input_sticker is not None:
+                request.flags |= 1
+            intro = TL_account.TL_inputBusinessIntro()
+            intro.title = title
+            intro.description = description
+            if input_sticker is not None:
+                intro.flags |= 1
+                intro.sticker = input_sticker
+            if request.flags & 1:
+                request.intro = intro
+                cached_intro = TL_account.TL_businessIntro()
+                cached_intro.title = title
+                cached_intro.description = description
+                if input_sticker is not None:
+                    try:
+                        cached_intro.sticker = sticker
+                        cached_intro.flags |= 1
+                    except Exception:
+                        pass
+
+        def received(response: Any, error: Any) -> None:
+            if error is not None:
+                done(False, self._error_text(error))
+            elif self._is_false(response):
+                done(False, "Сервер отклонил изменение")
+            else:
+                try:
+                    self._cache_user_full_field(
+                        session, "business_intro", cached_intro, 16
+                    )
+                except Exception:
+                    pass
+                done(True, "")
+
+        self._send_request(session, request, received)
+
+    def _simple(
+        self,
+        session: Dict[str, Any],
+        request: Any,
+        done: Callable[[bool, str], None],
+    ) -> None:
+        def received(response: Any, error: Any) -> None:
+            if error is not None:
+                done(False, self._error_text(error))
+            elif self._is_false(response):
+                done(False, "Сервер отклонил изменение")
+            else:
+                done(True, "")
+
+        self._send_request(session, request, received)
+
+    def _serial(
+        self,
+        session: Dict[str, Any],
+        requests: Sequence[Any],
+        done: Callable[[bool, str], None],
+        index: int = 0,
+        errors: Optional[List[str]] = None,
+    ) -> None:
+        if errors is None:
+            errors = []
+        if index >= len(requests):
+            done(not errors, "; ".join(errors[:3]))
+            return
+
+        def received(response: Any, error: Any) -> None:
+            if error is not None:
+                errors.append(self._error_text(error))
+            elif self._is_false(response):
+                errors.append("Сервер отклонил операцию")
+            self._serial(
+                session, requests, done, index + 1, errors
+            )
+
+        self._send_request(session, requests[index], received)
+
+
+    def _finish(self, session: Dict[str, Any]) -> None:
+        if not self._valid_session(session):
+            return
+        session["running"] = False
+        session["completed"] = True
+        self._set_loading(session, False)
+        button = session.get("button")
+        if button is not None:
+            try:
+                button.setText("Готово", False)
+                button.setEnabled(True)
+
+                def close_sheet() -> None:
+                    sheet = session.get("sheet")
+                    if sheet is not None:
+                        try:
+                            sheet.dismiss()
+                        except Exception:
+                            pass
+
+                click = _ClickListener(close_sheet)
+                session["callbacks"].append(click)
+                button.setOnClickListener(click)
+            except Exception:
+                pass
+        self._refresh(session)
+        self._result(session)
+
+    def _refresh(self, session: Dict[str, Any]) -> None:
+        account = int(session["account"])
+        controller = MessagesController.getInstance(account)
+        user = UserConfig.getInstance(account).getCurrentUser()
+        if user is None:
+            return
+        try:
+            controller.loadFullUser(user, 0, True)
+        except Exception:
+            pass
+        try:
+            photos = controller.getDialogPhotos(int(user.id))
+            photos.reset()
+            photos.load(0, int(getattr(photos, "STEP", 80)))
+        except Exception:
+            pass
+        try:
+            center = NotificationCenter.getInstance(account)
+            center.postNotificationName(
+                NotificationCenter.mainUserInfoChanged
+            )
+            center.postNotificationName(
+                NotificationCenter.updateInterfaces,
+                Integer(int(MessagesController.UPDATE_MASK_ALL)),
+            )
+        except Exception:
+            pass
+        try:
+            UserConfig.getInstance(account).saveConfig(True)
+        except Exception:
+            pass
+
+    def _result(self, session: Dict[str, Any]) -> None:
+        success = [
+            item for item in session["results"] if item[1] == "success"
+        ]
+        skipped = [
+            item for item in session["results"] if item[1] == "skipped"
+        ]
+        failed = [
+            item for item in session["results"] if item[1] == "failed"
+        ]
+        lines = [
+            (
+                f"Восстановлено: {len(success)}"
+                if session.get("restore_mode")
+                else f"Скопировано: {len(success)}"
+            ),
+            f"Пропущено: {len(skipped)}",
+            f"Ошибок: {len(failed)}",
+        ]
+        if session.get("backup_created"):
+            lines.extend(
+                [
+                    "",
+                    "Резервная копия изменённых полей сохранена.",
+                ]
+            )
+        if success:
+            lines.extend(
+                [
+                    "",
+                    "Готово:",
+                    *[f"✓ {FIELD_LABELS[key]}" for key, _, _ in success],
+                ]
+            )
+        if skipped:
+            lines.extend(
+                [
+                    "",
+                    "Пропущено:",
+                    *[
+                        f"• {FIELD_LABELS[key]} — {message}"
+                        for key, _, message in skipped
+                    ],
+                ]
+            )
+        if failed:
+            lines.extend(
+                [
+                    "",
+                    "Ошибки:",
+                    *[
+                        f"• {FIELD_LABELS[key]} — {message}"
+                        for key, _, message in failed
+                    ],
+                ]
+            )
+        try:
+            context = session["activity"]
+            provider = session["provider"]
+            builder = (
+                AlertDialog.Builder(context, provider)
+                if provider is not None
+                else AlertDialog.Builder(context)
+            )
+            builder.setTitle(
+                (
+                    "Профиль восстановлен"
+                    if session.get("restore_mode")
+                    else "Профиль скопирован"
+                )
+                if not failed
+                else (
+                    "Восстановление завершено"
+                    if session.get("restore_mode")
+                    else "Копирование завершено"
+                )
+            )
+            builder.setMessage("\n".join(lines))
+            builder.setPositiveButton("Готово", None)
+            builder.show()
+        except Exception:
+            self._show_info(
+                (
+                    f"Восстановлено: {len(success)}, ошибок: {len(failed)}"
+                    if session.get("restore_mode")
+                    else f"Скопировано: {len(success)}, ошибок: {len(failed)}"
+                )
+            )

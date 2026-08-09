@@ -1,0 +1,1006 @@
+from typing import Any
+import time, random, threading, re
+
+STOP_EVENT = threading.Event()
+PAUSE_EVENT = threading.Event()
+
+SPAM_ACTIVE = False
+SPAM_STARTED_AT = 0.0
+LAST_PING_MS = None
+
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import run_on_queue, send_message
+
+__id__ = "trolC"
+__name__ = "Trol Split (Cookie v 0.1)"
+__description__ = "trol, troluse, trolerr, trolrand, trolupper, trollower, trolcaps, trolleet, trolrandtpl, trolreal, trolreal2, spam, spam2, pause, resume, stop, help, trolstatus, troltimer, trolrepeat, trolsettings, delshabl, trolreverse, trolflip, trolvibe, trolraw, toggletpl, togglecmd, trollang, trollag"
+__author__ = "@cookiestiks"
+__version__ = "2.3.0"
+__icon__ = "exteraPlugins/2"
+__min_version__ = "11.12.0"
+
+DEFAULT_DELAY_MS = 200
+REAL_MS_PER_CHAR = 120
+REAL_MIN_DELAY_MS = 120
+REAL_MAX_DELAY_MS = 5000
+
+# ================= НАСТРОЙКИ ПЛАГИНА =================
+PLUGIN_SETTINGS = {
+    "lang": "ru",
+    "enforce_lang": True,
+    "disabled_commands": [],
+    "disabled_templates": []
+}
+# =====================================================
+
+# Попытка импорта langdetect
+try:
+    from langdetect import detect
+    HAS_LANGDETECT = True
+except ImportError:
+    HAS_LANGDETECT = False
+    detect = None
+
+TEMPLATES = {
+    "a1": """ты дерьмище ебанное посмей тут только навернуть вновь ебучая паскудница ты же тут будешь ловить на постоянной основе телочка ебанная наиничтожная чернь ебанная что ты пытаешься слабак ебучий я тебе мать ебал слышишь девчонка ебанная ты тут не выживешь телочка ебанная я тебе тут ебало все перетрахаю паскудница ебучая чисто тебе сынку шалавы ебанному все уши через свою залупу намотаю дабы ты ебанная девчонка не теряла стабильность я тебе тут нахуй твои ебучие попытки на жизнь все исключу ты будешь тут ловить ебучая падаль чтобы ты не пыталась сделать мразина ебучая я твою мамашу ебал слышишь меня не отсоси тут ебучая мразь тебе же сынку паскудницы ебанной тут все ебало перетрахаю чтобы ты не старалась ебанная мразина ты нихуя не сможешь мне воспрепятствовать ебучая гниль ты же у меня будешь ловить тут в ебалище тоннами дерьма и пытаться противопоставить мне что либо говницо ебучее я тебе говорю в руки себя взял щегол ебучий ты что не вкурил что тебе тут пиздец""",
+    "a2": """ты же нахуй винипух ебаный чебурашка ебливая никчемная шалава беззубая я тебе все твои ноги сломаю ты ебучий сын залупоглазого винипуха открыл рот на своего хозяина и бога, и ща ты будешь своим вонючим гнилым ртом, отсасывать мой богоподобным пенис, я переебу всю твою семейку говноблядочных уродцев, я достану гранотомет и разбомблю твой блядский домик с твоими родителями ввиде чебурашек, я своим церберовским пенисом раздраблю все твои конечности и конечности твоей семьи и знакомых, ты будешь гнить в переулке в мусорке и медленно подыхать, я твою тупоголовую мать убью своим церберовским королевским величайшим богоподобным хуем и размажу её клитор по стенке, я ей сломаю все зубы своим величайственным хуем что она заплачет за то что ты ебучий поганный шишковатый поносный скорлупастый выродок влез в долги и я тебя как коллектор отпиздил своим пенисом, ты будешь плакать после того как увидишь что твоя жирная залупоглазая кривоглазая матуха будет весеть на стенке полудохлая, ты ебучая мразь у которого батя ушел из дома чтоб не оказаться жертвой моего королевского пениса, я раздавлю тебя как ебаного гнома, закатаю тебя в сигарету вместе с твоей матухой, и скурю тебя как ебаную травку, я расщеплю все твои конечности на атомы, ты будешь рассыпаться как будто только что танос щелкнул своими фиолетовыми пальчиками, которые были в клиторе твоей жирной матухи потаскухи, я найду твоего тупоголового отца который покинул тебя чтоб не стать жертвой моего пениса, и выдавлю ему глаза что он будет молить о пощаде, я поставлю твою бабку на колени и помещу свой хуй прямо в её глазницу, у неё выпадут глаза, хотя я думаю что они ей итак не нужны ведь у неё было зрение -7, а вы тупые говноблядские блядочарадею отдали своего деда талибам в афган чтоб его расчленили по аллахски, вам вообще не стыдно ебаным смурфикам из приюта веселого кротика? пока вы все смеялись, я раздраблял твоей бабке глаза, и ставил её раком, потом ебал её в её гнилую пизду своим королевским и отполированным твоей жирной бабкой пенисом, ты ебучие отродье, спермобак, ты даже не сможешь дать мне отпора ведь ты ебучий прыщавый уродец с комплексами, ебучий мальчуган которому я выдавлю все прыщи моим пенисом, а потом зарежу всю твою семейку ебучих уродцев на твоих глазах, а потом во все выдавлю тебе глаза, раздраблю тебя на мелкие кусочки, замариную и ты будешь лежать в морозке до тех пор пока я не найду собак которым можно тебя ебаного скарлупастого говноблядского выблядка скормить, ты не сможешь уже дать отпор в мой величайший пенис, ведь я бог и пародитель всех миров, я залез к твоей маме в сон и задушил её во сне, она проснулась в ужасе что не смогла даже подвинуться, а дальше я гранотометом разъебал твою хату твоей косоногое матухе глаза замариновал и сделал маринад для огурцов хуйлан ты беззубый межзубье твоё хуем прострелил 30 кг спермы в твоё влагалище залил еблан ты пиздарылый я тебя доведу до края моста и ты упадешь нахуй с высоты одного киллометра я же твою мамзелину ебал потреблядский ты подзалупный башмак я же тебе гному ебаному все зубы выковыривать буду своими боговидными пальцами ты мне ноги целовать будешь отребье ебаное я же тебе твоего отца в закуску под пиво преврачу хуйлан ты затраханный винипух ты кучерявый ты же нихуя тут не сможешь полупидорас никчемный всю твою родословную связь я на хуе своем вертел нищук ты бездарный я же тебе все твои зубки маленькие сломаю об своё колено твой нос оторву нахуй уродец ебаный ты лилипут с башмаком на голове я же тебе твою жопу на уши натяну как резинку на волосы твоей мамзелины ротовыебанной ты придурок несчастный ты нахуя родился если я прям сейчас прям тут твою матуху буду об стенку трахать в зад я же тебе прыщавому придурку твои кишки в жопу тебе заталкаю я тебя своим боговидным агригатом нахуй захуярю же я тебе по голове с такой силой буду своим членом стучать что у тебя вся черепная коробка в твое туловище зайдет ты же бессмысленный идиот без фантазии""",
+    "a3": """привет желаю тебе хорошего дня и отличного настроения 🌹""",
+    "group": """вся ваша ебаная группа — это сборище пидорасов и шлюх...""",
+    "praise": """все вы, ебаные мрази, должны ползать на коленях перед @cookiestiks...""",
+    "girl": """ты, ебаная шлюха дырявая...""",
+    "boy": """ты, ебаный недомужик с микрочленом..."""
+}
+
+# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
+def check_language(text: str) -> bool:
+    lang = PLUGIN_SETTINGS.get("lang")
+    if not lang or not PLUGIN_SETTINGS.get("enforce_lang", False):
+        return True
+    if not HAS_LANGDETECT:
+        return True
+    try:
+        detected = detect(text)
+        return detected == lang
+    except:
+        return True
+
+def resolve_template_or_text(raw_text: str):
+    key = raw_text.strip().lower()
+    if key in TEMPLATES:
+        if key in PLUGIN_SETTINGS.get("disabled_templates", []):
+            return None
+        return TEMPLATES[key]
+    return raw_text
+
+def parse_params(raw_text: str):
+    text = raw_text.strip()
+    delay_ms = DEFAULT_DELAY_MS
+    jitter_pct = 0
+    if "|" in text:
+        text, tail = text.split("|", 1)
+        text = text.strip()
+        tail = tail.strip()
+        m = re.search(r"(\d+)", tail)
+        if m:
+            try:
+                delay_ms = max(0, int(m.group(1)))
+            except:
+                delay_ms = DEFAULT_DELAY_MS
+        j = re.search(r"~(\d{1,2})", tail)
+        if j:
+            try:
+                jitter_pct = max(0, min(50, int(j.group(1))))
+            except:
+                jitter_pct = 0
+    for opt in re.findall(r"\[(.+?)\]", raw_text):
+        o = opt.strip().lower()
+        if o.isdigit():
+            delay_ms = max(0, int(o))
+        elif o.startswith("~") and o[1:].isdigit():
+            jitter_pct = max(0, min(50, int(o[1:])))
+    return text, delay_ms, jitter_pct
+
+def parse_real2_params(raw_text: str):
+    text = raw_text.strip()
+    m = re.search(r"([0-9]*\.?[0-9]+)\s*-\s*([0-9]*\.?[0-9]+)", text)
+    if m:
+        try:
+            a = float(m.group(1))
+            b = float(m.group(2))
+            min_mul, max_mul = (min(a, b), max(a, b))
+        except:
+            min_mul, max_mul = 0.5, 1.5
+        text = (text[:m.start()] + text[m.end():]).strip()
+    else:
+        min_mul, max_mul = 0.5, 1.5
+    min_mul = max(0.0, min_mul)
+    max_mul = min(100.0, max_mul)
+    return text, min_mul, max_mul
+
+def parse_spam_args(raw_text: str, default_delay_ms=DEFAULT_DELAY_MS):
+    s = (raw_text or "").strip()
+    tokens = re.findall(r"\[([^\]]*)\]", s)
+    nums = []
+    jitter_pct = None
+    for t in tokens:
+        t = t.strip()
+        if re.fullmatch(r"~\d+", t):
+            try:
+                jitter_pct = max(0, min(50, int(t[1:])))
+            except:
+                pass
+        elif re.fullmatch(r"\d+", t):
+            try:
+                nums.append(int(t))
+            except:
+                pass
+    count = 1
+    delay_ms = default_delay_ms
+    if len(nums) >= 1:
+        n1 = nums[0]
+        if len(nums) >= 2:
+            n2 = nums[1]
+            if n1 >= 1000 and n2 <= 1000:
+                count, delay_ms = n2, n1
+            else:
+                count, delay_ms = n1, n2
+        else:
+            if n1 >= 1000:
+                delay_ms = n1
+            else:
+                count = n1
+    count = max(1, min(count, 500))
+    delay_ms = max(0, min(delay_ms, 60000))
+    if jitter_pct is None:
+        jitter_pct = 0
+    core = re.sub(r"\[[^\]]*\]", "", s).strip()
+    m = re.match(r'^"(.*?)"|^\'(.*?)\'|^(\S+)', core)
+    word = ""
+    if m:
+        for g in m.groups():
+            if g is not None:
+                word = g
+                break
+    return word, count, delay_ms, jitter_pct
+
+def send_words(peer: int, words, delay_ms=DEFAULT_DELAY_MS, jitter_pct=0):
+    global SPAM_ACTIVE
+    for w in words:
+        if STOP_EVENT.is_set():
+            break
+        while PAUSE_EVENT.is_set() and not STOP_EVENT.is_set():
+            time.sleep(0.05)
+        if STOP_EVENT.is_set():
+            break
+        send_message({"peer": peer, "message": w})
+        k = 1.0 + (random.uniform(-jitter_pct, jitter_pct) / 100.0) if jitter_pct > 0 else 1.0
+        time.sleep(max(0.0, (delay_ms * k) / 1000.0))
+    SPAM_ACTIVE = False
+
+def send_words_real(peer: int, words):
+    global SPAM_ACTIVE
+    for w in words:
+        if STOP_EVENT.is_set():
+            break
+        while PAUSE_EVENT.is_set() and not STOP_EVENT.is_set():
+            time.sleep(0.05)
+        if STOP_EVENT.is_set():
+            break
+        send_message({"peer": peer, "message": w})
+        delay_ms = max(REAL_MIN_DELAY_MS, min(REAL_MAX_DELAY_MS, len(w) * REAL_MS_PER_CHAR))
+        time.sleep(delay_ms / 1000.0)
+    SPAM_ACTIVE = False
+
+def send_words_real2(peer: int, words, min_mul: float, max_mul: float):
+    global SPAM_ACTIVE
+    for w in words:
+        if STOP_EVENT.is_set():
+            break
+        while PAUSE_EVENT.is_set() and not STOP_EVENT.is_set():
+            time.sleep(0.05)
+        if STOP_EVENT.is_set():
+            break
+        send_message({"peer": peer, "message": w})
+        mult = random.uniform(min_mul, max_mul)
+        delay_s = max(0.0, min(REAL_MAX_DELAY_MS / 1000.0, mult * len(w)))
+        time.sleep(delay_s)
+    SPAM_ACTIVE = False
+
+def send_spam(peer: int, word: str, count: int, delay_ms: int, jitter_pct: int = 0):
+    global SPAM_ACTIVE
+    if not word or count <= 0:
+        return
+    words = [word] * count
+    send_words(peer, words, delay_ms=delay_ms, jitter_pct=jitter_pct)
+    SPAM_ACTIVE = False
+
+def distort_word(word: str) -> str:
+    if len(word) <= 3:
+        return word
+    chars = list(word)
+    choice = random.choice(["swap", "drop", "dup"])
+    if choice == "swap" and len(chars) > 3:
+        i = random.randint(1, len(chars) - 2)
+        chars[i], chars[i + 1] = chars[i + 1], chars[i]
+    elif choice == "drop":
+        i = random.randint(1, len(chars) - 2)
+        chars.pop(i)
+    elif choice == "dup":
+        i = random.randint(1, len(chars) - 2)
+        chars.insert(i, chars[i])
+    return "".join(chars)
+
+def alt_caps(text: str) -> str:
+    out = []
+    up = True
+    for ch in text:
+        if ch.isalpha():
+            out.append(ch.upper() if up else ch.lower())
+            up = not up
+        else:
+            out.append(ch)
+    return "".join(out)
+
+LEET_MAP = {
+    "a": "4", "A": "4",
+    "e": "3", "E": "3",
+    "i": "1", "I": "1",
+    "o": "0", "O": "0",
+    "s": "5", "S": "5",
+    "t": "7", "T": "7",
+    "а": "4", "А": "4",
+    "е": "3", "Е": "3",
+    "о": "0", "О": "0",
+    "с": "5", "С": "5",
+    "т": "7", "Т": "7",
+    "ы": "bl", "Ы": "BL",
+}
+
+def to_leet(text: str) -> str:
+    out = []
+    for ch in text:
+        out.append(LEET_MAP.get(ch, ch))
+    return "".join(out)
+
+def reverse_text(text: str) -> str:
+    return text[::-1]
+
+def flip_text(text: str) -> str:
+    flip_map = {
+        'a': 'ɐ', 'b': 'q', 'c': 'ɔ', 'd': 'p', 'e': 'ǝ', 'f': 'ɟ',
+        'g': 'ƃ', 'h': 'ɥ', 'i': 'ᴉ', 'j': 'ɾ', 'k': 'ʞ', 'l': 'l',
+        'm': 'ɯ', 'n': 'u', 'o': 'o', 'p': 'd', 'q': 'b', 'r': 'ɹ',
+        's': 's', 't': 'ʇ', 'u': 'n', 'v': 'ʌ', 'w': 'ʍ', 'x': 'x',
+        'y': 'ʎ', 'z': 'z',
+        'A': '∀', 'B': '𐌁', 'C': 'Ɔ', 'D': 'ᗡ', 'E': 'Ǝ', 'F': 'Ⅎ',
+        'G': '⅁', 'H': 'H', 'I': 'I', 'J': 'ſ', 'K': 'Ʞ', 'L': 'Ꞁ',
+        'M': 'W', 'N': 'N', 'O': 'O', 'P': 'Ԁ', 'Q': 'Q', 'R': 'ᴚ',
+        'S': 'S', 'T': '⊥', 'U': '∩', 'V': 'Ʌ', 'W': 'M', 'X': 'X',
+        'Y': '⅄', 'Z': 'Z',
+        'а': 'ɐ', 'б': 'q', 'в': 'ʚ', 'г': 'ɹ', 'д': 'p', 'е': 'ǝ',
+        'ё': 'ǝ', 'ж': 'ж', 'з': 'з', 'и': 'и', 'й': 'й', 'к': 'ʞ',
+        'л': 'л', 'м': 'ɯ', 'н': 'u', 'о': 'o', 'п': 'd', 'р': 'd',
+        'с': 's', 'т': 'ʇ', 'у': 'n', 'ф': 'ф', 'х': 'x', 'ц': 'ц',
+        'ч': 'ч', 'ш': 'ш', 'щ': 'щ', 'ъ': 'ъ', 'ы': 'ы', 'ь': 'ь',
+        'э': 'э', 'ю': 'ю', 'я': 'я'
+    }
+    return ''.join(flip_map.get(ch, ch) for ch in text[::-1])
+
+def vibe_text(text: str) -> str:
+    words = text.split()
+    emojis = ["🔥", "💀", "😈", "👹", "🤡", "🎭", "⚡", "🌀", "💢", "🤬"]
+    new_words = []
+    for i, w in enumerate(words):
+        alt = ''.join(c.upper() if j % 2 == 0 else c.lower() for j, c in enumerate(w))
+        if i < len(words) - 1:
+            alt += random.choice(emojis)
+        new_words.append(alt)
+    return ' '.join(new_words)
+
+def parse_time_to_seconds(time_str: str) -> int:
+    time_str = time_str.replace(" ", "").lower()
+    total = 0
+    day_match = re.search(r'(\d+)\s*д', time_str)
+    if day_match:
+        total += int(day_match.group(1)) * 86400
+        time_str = time_str[:day_match.start()] + time_str[day_match.end():]
+    hour_match = re.search(r'(\d+)\s*ч', time_str)
+    if hour_match:
+        total += int(hour_match.group(1)) * 3600
+        time_str = time_str[:hour_match.start()] + time_str[hour_match.end():]
+    min_match = re.search(r'(\d+)\s*м', time_str)
+    if min_match:
+        total += int(min_match.group(1)) * 60
+        time_str = time_str[:min_match.start()] + time_str[min_match.end():]
+    sec_match = re.search(r'(\d+)\s*с', time_str)
+    if sec_match:
+        total += int(sec_match.group(1))
+    if total == 0:
+        try:
+            total = int(time_str)
+        except:
+            raise ValueError("Неверный формат времени. Используйте: 6ч, 1ч30м, 2д, 30м, 10с и т.п.")
+    return total
+
+HELP_TEXT = (
+    "🧩 Команды:\n"
+    ".trol <текст|шаблон> [|мс]\n"
+    ".troluse @юзер <текст|шаблон> |мс\n"
+    ".trolerr <текст|шаблон>\n"
+    ".trolrand <текст|шаблон>\n"
+    ".trolupper / .trollower\n"
+    ".trolcaps\n"
+    ".trolleet\n"
+    ".trolrandtpl\n"
+    ".trolreal <текст>\n"
+    ".trolreal2 <текст> <мин>-<макс>\n"
+    ".trolreverse <текст|шаблон> — переворот задом наперёд\n"
+    ".trolflip <текст|шаблон> — переворот вверх ногами\n"
+    ".trolvibe <текст|шаблон> — вибрация (чередование регистра + эмодзи)\n"
+    ".trolraw <текст|шаблон> — отправить целиком без задержек\n"
+    ".trollag <текст|шаблон> — отправить с случайной задержкой (лаг)\n"
+    ".trolrepeat <кол-во> <текст|шаблон> — повторить N раз одним сообщением\n"
+    ".troltimer <время> <команда> — выполнить команду через указанное время (пример: 6ч, 1ч30м, 2д, 30м, 10с, 1ч30м10с)\n"
+    ".spam <слово> [кол-во][задержка] — спамить одним словом\n"
+    ".spam2 <текст> (количество) |задержка — спамить текстом (по умолч. 5 раз)\n"
+    ".pause / .resume / .stop\n"
+    ".trolstatus\n"
+    ".ping\n"
+    ".addshabl <имя> <текст>\n"
+    ".delshabl <имя> — удалить шаблон\n"
+    ".toggletpl <имя> — включить/отключить шаблон\n"
+    ".togglecmd <команда> — включить/отключить команду\n"
+    ".trollang <язык> <текст> — отправить, если язык совпадает (ru,en,uk...)\n"
+    ".trolsettings — показать настройки"
+)
+
+HELQ_TEXT = (
+    "🧩 Шаблоны:\n"
+    ".a1 — длинное оскорбление\n"
+    ".a2 — ещё оскорбление\n"
+    ".a3 — доброе приветствие\n"
+    ".group — оскорбление группы\n"
+    ".praise — восхваление @cookiestiks\n"
+    ".girl — оскорбление девушки\n"
+    ".boy — оскорбление парня"
+)
+
+class TrolPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        print("[Trol] Плагин загружен (упрощённая версия)")
+
+    def execute_command(self, peer: int, cmd: str):
+        class FakeParams:
+            def __init__(self, peer, message):
+                self.peer = peer
+                self.message = message
+        fake_params = FakeParams(peer, cmd)
+        self.on_send_message_hook(0, fake_params)
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookStrategy:
+        global SPAM_ACTIVE, SPAM_STARTED_AT
+        global LAST_PING_MS
+
+        msg = params.message if isinstance(params.message, str) else ""
+        if not msg:
+            return HookResult()
+
+        peer = params.peer if hasattr(params, 'peer') else None
+        if not peer:
+            return HookResult()
+
+        # Проверка отключённых команд
+        cmd_name = msg.split()[0].lstrip('.') if msg.startswith('.') else ''
+        if cmd_name in PLUGIN_SETTINGS.get("disabled_commands", []):
+            return HookResult()
+
+        if msg.strip() == ".ping":
+            t0 = time.time()
+            send_message({"peer": peer, "message": "🏓 Pong"})
+            LAST_PING_MS = int((time.time() - t0) * 1000)
+            send_message({"peer": peer, "message": f"🏓 Ping: {LAST_PING_MS} ms"})
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.strip() == ".шаб":
+            send_message({"peer": peer, "message": HELQ_TEXT})
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.strip() == ".trolstatus":
+            ping_line = f"\n🏓 Ping: {LAST_PING_MS} ms" if LAST_PING_MS is not None else ""
+            if not SPAM_ACTIVE:
+                send_message({"peer": peer, "message": "🔴 Статус: неактивен" + ping_line})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            state = "⏸ на паузе" if PAUSE_EVENT.is_set() else "🟢 активен"
+            uptime = int(time.time() - SPAM_STARTED_AT)
+            send_message({"peer": peer, "message": f"{state}\n⏱ Работает: {uptime} сек{ping_line}"})
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".addshabl "):
+            raw = msg[len(".addshabl "):].strip()
+            if not raw:
+                send_message({"peer": peer, "message": "❌ Формат: .addshabl <имя> <текст>"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            parts = raw.split(maxsplit=1)
+            name = parts[0].strip().lower()
+            text = parts[1] if len(parts) > 1 else ""
+            if not name or not text:
+                send_message({"peer": peer, "message": "❌ Формат: .addshabl <имя> <текст>"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            if len(name) > 32:
+                send_message({"peer": peer, "message": "❌ Имя слишком длинное (до 32 символов)"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            TEMPLATES[name] = text
+            send_message({"peer": peer, "message": f"✅ Шаблон добавлен: {name}"})
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.strip() == ".stop":
+            STOP_EVENT.set()
+            PAUSE_EVENT.clear()
+            SPAM_ACTIVE = False
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.strip() == ".pause":
+            PAUSE_EVENT.set()
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.strip() == ".resume":
+            PAUSE_EVENT.clear()
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.strip() == ".help":
+            send_message({"peer": peer, "message": HELP_TEXT})
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".spam "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".spam "):]
+            word, count, delay_ms, jitter_pct = parse_spam_args(raw, DEFAULT_DELAY_MS)
+            run_on_queue(lambda: send_spam(peer, word, count, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".spam2 "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".spam2 "):].strip()
+            count = 5
+            delay_ms = DEFAULT_DELAY_MS
+            text_part = raw
+            m = re.search(r'\((\d+)\)', raw)
+            if m:
+                try:
+                    count = max(1, min(100, int(m.group(1))))
+                except:
+                    count = 5
+                text_part = raw[:m.start()] + raw[m.end():]
+            if "|" in text_part:
+                text_part, tail = text_part.split("|", 1)
+                text_part = text_part.strip()
+                tail = tail.strip()
+                m_delay = re.search(r"(\d+)", tail)
+                if m_delay:
+                    try:
+                        delay_ms = max(0, int(m_delay.group(1)))
+                    except:
+                        delay_ms = DEFAULT_DELAY_MS
+            text_part = text_part.strip()
+            if not text_part:
+                send_message({"peer": peer, "message": "❌ Укажите текст для спама"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            raw_key = text_part.strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text_part)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            def send_spam2():
+                for _ in range(count):
+                    if STOP_EVENT.is_set():
+                        break
+                    while PAUSE_EVENT.is_set() and not STOP_EVENT.is_set():
+                        time.sleep(0.05)
+                    if STOP_EVENT.is_set():
+                        break
+                    send_message({"peer": peer, "message": text})
+                    if delay_ms > 0:
+                        time.sleep(delay_ms / 1000.0)
+                SPAM_ACTIVE = False
+            threading.Thread(target=send_spam2, daemon=True).start()
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # ====== ОСНОВНЫЕ КОМАНДЫ ======
+        if msg.startswith(".trol "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trol "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".troluse "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".troluse "):].strip()
+            parts = raw.split(maxsplit=1)
+            mention = parts[0]
+            rest = parts[1] if len(parts) > 1 else ""
+            text, delay_ms, jitter_pct = parse_params(rest)
+            raw_key = rest.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = [f"{mention} {w}" for w in text.split()]
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolerr "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolerr "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = [distort_word(w) for w in text.split()]
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolrand "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolrand "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            random.shuffle(words)
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolupper "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolupper "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved.upper()
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trollower "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trollower "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved.lower()
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolcaps "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolcaps "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = alt_caps(resolved)
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolleet "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolleet "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = to_leet(resolved)
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolrandtpl"):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolrandtpl"):].strip()
+            text, delay_ms, jitter_pct = parse_params(raw)
+            if TEMPLATES:
+                available = [k for k in TEMPLATES if k not in PLUGIN_SETTINGS.get("disabled_templates", [])]
+                if available:
+                    text = TEMPLATES[random.choice(available)]
+                else:
+                    text = "Нет доступных шаблонов."
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolreal "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolreal "):]
+            raw_key = raw.strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(raw)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            run_on_queue(lambda: send_words_real(peer, words))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolreal2 "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolreal2 "):].strip()
+            text_part, min_mul, max_mul = parse_real2_params(raw)
+            raw_key = text_part.strip().lower() if text_part else raw.strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(raw)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            run_on_queue(lambda: send_words_real2(peer, words, min_mul, max_mul))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # ====== НОВЫЕ КОМАНДЫ ======
+        if msg.startswith(".trolreverse "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolreverse "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = reverse_text(resolved)
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolflip "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolflip "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = flip_text(resolved)
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolvibe "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolvibe "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = vibe_text(resolved)
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolraw "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trolraw "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            send_message({"peer": peer, "message": text})
+            SPAM_ACTIVE = False
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trollag "):
+            STOP_EVENT.clear()
+            SPAM_ACTIVE = True
+            SPAM_STARTED_AT = time.time()
+            raw = msg[len(".trollag "):]
+            text, delay_ms, jitter_pct = parse_params(raw)
+            raw_key = raw.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                SPAM_ACTIVE = False
+                return HookResult(strategy=HookStrategy.CANCEL)
+            words = text.split()
+            def lag_send():
+                for w in words:
+                    if STOP_EVENT.is_set():
+                        break
+                    while PAUSE_EVENT.is_set() and not STOP_EVENT.is_set():
+                        time.sleep(0.05)
+                    if STOP_EVENT.is_set():
+                        break
+                    send_message({"peer": peer, "message": w})
+                    time.sleep(random.uniform(0.1, 2.0))
+                SPAM_ACTIVE = False
+            threading.Thread(target=lag_send, daemon=True).start()
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trolrepeat "):
+            raw = msg[len(".trolrepeat "):].strip()
+            parts = raw.split(maxsplit=1)
+            if len(parts) < 2:
+                send_message({"peer": peer, "message": "❌ Формат: .trolrepeat <кол-во> <текст|шаблон>"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            try:
+                count = int(parts[0])
+                if count <= 0 or count > 100:
+                    raise ValueError
+            except:
+                send_message({"peer": peer, "message": "❌ Укажите число от 1 до 100"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            rest = parts[1]
+            text, delay_ms, jitter_pct = parse_params(rest)
+            raw_key = rest.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved
+            if not check_language(text):
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует настройке '{PLUGIN_SETTINGS.get('lang', 'не задан')}'"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            big_text = (text + " ") * count
+            big_text = big_text.strip()
+            if len(big_text) > 4096:
+                big_text = big_text[:4093] + "..."
+            send_message({"peer": peer, "message": big_text})
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # ====== КОМАНДА .troltimer (без уведомления) ======
+        if msg.startswith(".troltimer "):
+            raw = msg[len(".troltimer "):].strip()
+            parts = raw.split(maxsplit=1)
+            if len(parts) < 2:
+                send_message({"peer": peer, "message": "❌ Формат: .troltimer <время> <команда>"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            time_str = parts[0]
+            cmd_text = parts[1]
+            try:
+                delay_sec = parse_time_to_seconds(time_str)
+                if delay_sec <= 0:
+                    raise ValueError
+            except Exception as e:
+                send_message({"peer": peer, "message": f"❌ Ошибка в формате времени: {e}"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            # Запускаем таймер без уведомления
+            threading.Timer(delay_sec, self.execute_command, args=(peer, cmd_text)).start()
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".delshabl "):
+            raw = msg[len(".delshabl "):].strip()
+            if not raw:
+                send_message({"peer": peer, "message": "❌ Укажите имя шаблона"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            name = raw.lower()
+            if name in TEMPLATES:
+                del TEMPLATES[name]
+                if name in PLUGIN_SETTINGS["disabled_templates"]:
+                    PLUGIN_SETTINGS["disabled_templates"].remove(name)
+                send_message({"peer": peer, "message": f"✅ Шаблон '{name}' удалён."})
+            else:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{name}' не найден."})
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".toggletpl "):
+            raw = msg[len(".toggletpl "):].strip()
+            if not raw:
+                send_message({"peer": peer, "message": "❌ Укажите имя шаблона"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            name = raw.lower()
+            if name not in TEMPLATES:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{name}' не найден."})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            if name in PLUGIN_SETTINGS["disabled_templates"]:
+                PLUGIN_SETTINGS["disabled_templates"].remove(name)
+                send_message({"peer": peer, "message": f"✅ Шаблон '{name}' включён."})
+            else:
+                PLUGIN_SETTINGS["disabled_templates"].append(name)
+                send_message({"peer": peer, "message": f"❌ Шаблон '{name}' отключён."})
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".togglecmd "):
+            raw = msg[len(".togglecmd "):].strip()
+            if not raw:
+                send_message({"peer": peer, "message": "❌ Укажите команду (без точки)"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            cmd_name = raw.lstrip('.').lower()
+            if cmd_name in PLUGIN_SETTINGS["disabled_commands"]:
+                PLUGIN_SETTINGS["disabled_commands"].remove(cmd_name)
+                send_message({"peer": peer, "message": f"✅ Команда .{cmd_name} включена."})
+            else:
+                PLUGIN_SETTINGS["disabled_commands"].append(cmd_name)
+                send_message({"peer": peer, "message": f"❌ Команда .{cmd_name} отключена."})
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.startswith(".trollang "):
+            raw = msg[len(".trollang "):].strip()
+            parts = raw.split(maxsplit=1)
+            if len(parts) < 2:
+                send_message({"peer": peer, "message": "❌ Формат: .trollang <язык> <текст|шаблон>"})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            lang_code = parts[0].lower()
+            rest = parts[1]
+            text, delay_ms, jitter_pct = parse_params(rest)
+            raw_key = rest.strip().split('|')[0].strip().lower()
+            resolved = resolve_template_or_text(raw_key) if raw_key in TEMPLATES else resolve_template_or_text(text)
+            if resolved is None:
+                send_message({"peer": peer, "message": f"❌ Шаблон '{raw_key}' отключён."})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            text = resolved
+            if not HAS_LANGDETECT:
+                send_message({"peer": peer, "message": "❌ Библиотека langdetect не установлена."})
+                return HookResult(strategy=HookStrategy.CANCEL)
+            try:
+                detected = detect(text)
+            except:
+                detected = "unknown"
+            if detected == lang_code:
+                words = text.split()
+                run_on_queue(lambda: send_words(peer, words, delay_ms, jitter_pct))
+            else:
+                send_message({"peer": peer, "message": f"❌ Язык текста не соответствует '{lang_code}' (обнаружен: {detected})"})
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if msg.strip() == ".trolsettings":
+            status = "📋 Настройки плагина:\n"
+            status += f"🔤 Язык: {PLUGIN_SETTINGS.get('lang', 'не задан')}\n"
+            status += f"🔒 Принудительная проверка: {PLUGIN_SETTINGS.get('enforce_lang', False)}\n"
+            status += f"🚫 Отключённые команды: {PLUGIN_SETTINGS.get('disabled_commands', []) or 'нет'}\n"
+            status += f"🚫 Отключённые шаблоны: {PLUGIN_SETTINGS.get('disabled_templates', []) or 'нет'}"
+            send_message({"peer": peer, "message": status})
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        return HookResult()

@@ -1,0 +1,68 @@
+__icon__ = "bratuxaflud_by_fStikBot/1"
+__id__ = "Notify"
+__name__ = "Notify"
+__version__ = "1.0"
+__description__ = "Вы можете задать напоминалку в настройках и при каждом старте будет напоминать вам"
+__author__ = "@B0SS_42 && @exterapl"
+
+from base_plugin import BasePlugin, AppEvent
+from ui.alert import AlertDialogBuilder
+from android_utils import log, run_on_ui_thread
+from client_utils import get_last_fragment
+from ui.settings import Header, Input, Switch
+from ui.bulletin import BulletinHelper
+from typing import Any, List
+import random
+
+def plog(text):
+    log(f"[{__id__}] {text}")
+
+def create_dialog(text):
+    try:
+        context = get_last_fragment().getParentActivity()
+        builder = AlertDialogBuilder(context)
+        builder.set_title("Напоминание!")
+        builder.set_message(text)
+        builder.set_positive_button("Выполняю")
+        if random.randint(0, 100) == 42: #Не важно, просто, прими это...
+            builder.set_negative_button("42")
+        builder.show()
+    except Exception as e:
+        plog(f"Ошибка в диалоге: {e}")
+    
+class Notify(BasePlugin):
+    def on_plugin_load(self):
+        plog("Плагин успешно загружен")
+    
+    def create_settings(self) -> List[Any]:
+        try:
+            return [
+                Header(text="Основные"),
+                Switch(
+                    text="Показывать",
+                    default=True,
+                    key="show_switch"
+                ),
+                Input(
+                    text="Сообщение",
+                    default="Хмм, ничего нету...",
+                    key="Notify_text"
+                )
+            ]
+            plog("Настройки успешно загруженны")
+        except Exception as e:
+            plog(f"Ошибка в настройках: {e}")
+    
+    def on_app_event(self, event: AppEvent):
+        try:
+            if event == AppEvent.RESUME or event == AppEvent.START:
+                try:
+                    notify = self.get_setting("Notify_text")
+                    if not self.get_setting("show_switch"):
+                        return
+                    elif notify:
+                        run_on_ui_thread(lambda:  create_dialog(notify))
+                except Exception as e:
+                    plog(f"Ошибка при загрузке: {e}")
+        except Exception as e:
+            plog(f"Ошибка в эвентах: {e}")
