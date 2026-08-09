@@ -1,0 +1,1551 @@
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from android.os import Looper
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import get_last_fragment
+from hook_utils import find_class
+from java import dynamic_proxy, jclass
+from java.util import ArrayList, HashMap, Locale
+from org.telegram.messenger import (
+    AndroidUtilities,
+    ChatObject,
+    MessageObject,
+    MessagesController,
+    MessagesStorage,
+    NotificationCenter,
+    SendMessagesHelper,
+    UserConfig,
+)
+from org.telegram.tgnet import ConnectionsManager, TLRPC
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Switch
+
+__id__ = "slowmode_queue"
+__name__ = "Slowmode Queue"
+__description__ = "ставит текстовые сообщения в очередь при медленном режиме"
+__author__ = "@itskotovski & @mishabotov >.<"
+__version__ = "2.0 [maybe stable]"
+__icon__ = "mishaplugins_by_fStikBot/1"
+
+
+MARKER_KEY = "slowmode_queue_marker"
+VISUAL_START_KEY = "slowmode_queue_visual_start"
+VISUAL_READY_KEY = "slowmode_queue_visual_ready"
+DEFAULT_SHOW_BULLETINS = True
+DEFAULT_SAFETY_MS = 100
+DEFAULT_VISUAL_ALPHA = 0.55
+DEFAULT_QUEUE_GAP_MS = 1000
+MIN_VISUAL_DURATION_MS = 150
+
+
+strings = {
+    "en": {
+        "show_bulletins": "Show notifications",
+        "show_bulletins_hint": "Show queue status after adding or failing to send a message.",
+        "safety_ms": "Safety delay (ms)",
+        "safety_ms_hint": "Extra wait after the slow mode timer expires.",
+        "queued_single": "Message queued until the timer ends",
+        "queued_many": "Queued messages: {count}",
+        "send_failed": "Failed to send the queued message",
+    },
+    "ru": {
+        "show_bulletins": "Показывать уведомления",
+        "show_bulletins_hint": "Отображать статус очереди при добавлении или ошибке отправки.",
+        "safety_ms": "Запас времени (мс)",
+        "safety_ms_hint": "Дополнительное ожидание после окончания таймера, чтобы избежать серверных ошибок.",
+        "queued_single": "Сообщение отложено до истечения таймера",
+        "queued_many": "Сообщений в очереди: {count}",
+        "send_failed": "Не удалось отправить сообщение из очереди",
+    }
+}
+
+
+def tr(key: str) -> str:
+    lang = Locale.getDefault().getLanguage()
+    return strings.get(lang, strings["en"]).get(key, key)
+
+
+@dataclass
+class QueueEntry:
+    marker: str
+    account: int
+    peer: int
+    params: Any
+    local_id: Optional[int] = None
+    waiting_server: bool = False
+    message_object: Any = None
+    queued_at_ms: int = 0
+    ready_at_ms: int = 0
+
+
+class SlowmodeQueueDelegate(dynamic_proxy(NotificationCenter.NotificationCenterDelegate)):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def didReceivedNotification(self, notification_id, account, *args):
+        self.plugin._on_notif(notification_id, account, *args)
+
+
+class _CheckSendButtonHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._prep_send(param.thisObject)
+
+    def after_hooked_method(self, param):
+        self.plugin._done_send(param.thisObject)
+
+
+class _SlowmodeBypassHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._prep_action(param.thisObject)
+
+    def after_hooked_method(self, param):
+        self.plugin._done_action(param.thisObject)
+
+
+class _EmojiSetDelegateHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            args = getattr(param, "args", None)
+            delegate = args[0] if args and len(args) > 0 else None
+            self.plugin._hook_emoji(delegate)
+        except Exception as error:
+            self.plugin.log(f"[slowmode_queue] setDelegate hook error: {error}")
+
+
+class _SetSlowModeTimerHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin._prep_timer(param)
+
+    def after_hooked_method(self, param):
+        self.plugin._done_timer(param.thisObject)
+
+
+class _GetSlowModeTimerHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        if self.plugin._bypass_ui(param.thisObject):
+            param.setResult(None)
+
+
+class _ChatMessageCellHook:
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            args = getattr(param, "args", None)
+            message_object = args[0] if args and len(args) > 0 else None
+            self.plugin._apply_cell_visual(param.thisObject, message_object)
+        except Exception as error:
+            self.plugin.log(f"[slowmode_queue] cell hook error: {error}")
+
+
+class SlowmodeQueuePlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._active = False
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._queues: Dict[Tuple[int, int], List[QueueEntry]] = {}
+        self._entries_by_marker: Dict[str, QueueEntry] = {}
+        self._local_to_marker: Dict[Tuple[int, int], str] = {}
+        self._worker_keys = set()
+        self._spoofed_slowmode_timers: Dict[int, int] = {}
+        self._field_cache: Dict[Tuple[str, str], Any] = {}
+        self._delegate = None
+        self._observed_accounts = set()
+        self._check_send_unhook = None
+        self._set_delegate_unhook = None
+        self._set_slowmode_timer_unhook = None
+        self._get_slowmode_timer_unhook = None
+        self._chat_cell_unhooks = []
+        self._action_unhooks = []
+        self._delegate_action_unhooks = []
+        self._hooked_delegate_classes = set()
+
+    def on_plugin_load(self):
+        self._active = True
+        self.add_on_send_message_hook(priority=-2147483648)
+        self._hook_send()
+        self._hook_timer()
+        self._hook_actions()
+        self._hook_cells()
+        self._patch_chat()
+
+    def on_plugin_unload(self):
+        self._active = False
+        self._release_queued_placeholders()
+        self.remove_hook("on_send_message_hook")
+        self._rm_obs()
+        if self._check_send_unhook:
+            self.unhook_method(self._check_send_unhook)
+            self._check_send_unhook = None
+        if self._set_delegate_unhook:
+            self.unhook_method(self._set_delegate_unhook)
+            self._set_delegate_unhook = None
+        if self._set_slowmode_timer_unhook:
+            self.unhook_method(self._set_slowmode_timer_unhook)
+            self._set_slowmode_timer_unhook = None
+        if self._get_slowmode_timer_unhook:
+            self.unhook_method(self._get_slowmode_timer_unhook)
+            self._get_slowmode_timer_unhook = None
+        for ref in self._chat_cell_unhooks:
+            if ref:
+                self.unhook_method(ref)
+        self._chat_cell_unhooks.clear()
+        for ref in self._action_unhooks:
+            if ref:
+                self.unhook_method(ref)
+        for ref in self._delegate_action_unhooks:
+            if ref:
+                self.unhook_method(ref)
+        self._action_unhooks.clear()
+        self._delegate_action_unhooks.clear()
+        self._hooked_delegate_classes.clear()
+        with self._condition:
+            self._queues.clear()
+            self._entries_by_marker.clear()
+            self._local_to_marker.clear()
+            self._worker_keys.clear()
+            self._spoofed_slowmode_timers.clear()
+            self._field_cache.clear()
+            self._condition.notify_all()
+
+    def create_settings(self):
+        return [
+            Switch(
+                key="show_bulletins",
+                text=tr("show_bulletins"),
+                subtext=tr("show_bulletins_hint"),
+                default=DEFAULT_SHOW_BULLETINS,
+                icon="msg_info",
+            ),
+            Input(
+                key="safety_ms",
+                text=tr("safety_ms"),
+                subtext=tr("safety_ms_hint"),
+                default=str(DEFAULT_SAFETY_MS),
+                icon="msg_contacts_time_solar",
+            ),
+        ]
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        try:
+            if not self._active:
+                return HookResult()
+
+            marker = self._get_marker(params)
+            if marker and self._is_known(marker):
+                return HookResult()
+
+            if not self._has_payload(params):
+                return HookResult()
+
+            if int(getattr(params, "scheduleDate", 0) or 0) != 0:
+                return HookResult()
+
+            peer = int(getattr(params, "peer", 0) or 0)
+            if peer >= 0:
+                return HookResult()
+
+            key = (int(account), peer)
+            if not self._should_queue(int(account), peer, key):
+                return HookResult()
+
+            entry = QueueEntry(
+                marker=uuid.uuid4().hex,
+                account=int(account),
+                peer=peer,
+                params=params,
+            )
+            self._set_marker(entry)
+            self._enqueue(key, entry)
+            return HookResult(strategy=HookStrategy.CANCEL)
+        except Exception as error:
+            self.log(f"[slowmode_queue] send hook error: {error}")
+            return HookResult()
+
+    def _hook_send(self):
+        try:
+            chat_enter_view = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+            boolean_type = jclass("java.lang.Boolean").TYPE
+
+            check_send_method = chat_enter_view.getClass().getDeclaredMethod("checkSendButton", boolean_type)
+            check_send_method.setAccessible(True)
+            self._check_send_unhook = self.hook_method(check_send_method, _CheckSendButtonHook(self))
+        except Exception as error:
+            self.log(f"[slowmode_queue] ui hook error: {error}")
+
+    def _hook_timer(self):
+        try:
+            chat_enter_view = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+            int_type = jclass("java.lang.Integer").TYPE
+
+            set_timer_method = chat_enter_view.getClass().getDeclaredMethod("setSlowModeTimer", int_type)
+            set_timer_method.setAccessible(True)
+            self._set_slowmode_timer_unhook = self.hook_method(set_timer_method, _SetSlowModeTimerHook(self))
+
+            get_timer_method = chat_enter_view.getClass().getDeclaredMethod("getSlowModeTimer")
+            get_timer_method.setAccessible(True)
+            self._get_slowmode_timer_unhook = self.hook_method(get_timer_method, _GetSlowModeTimerHook(self))
+        except Exception as error:
+            self.log(f"[slowmode_queue] slowmode ui hook error: {error}")
+
+    def _hook_actions(self):
+        try:
+            chat_enter_view = find_class("org.telegram.ui.Components.ChatActivityEnterView")
+            bypass_hook = _SlowmodeBypassHook(self)
+            self._hook_named(chat_enter_view, self._action_unhooks, bypass_hook, {("onStickerSelected", 8)})
+
+            emoji_view = find_class("org.telegram.ui.Components.EmojiView")
+            for method in list(emoji_view.getClass().getDeclaredMethods()):
+                try:
+                    if method.getName() != "setDelegate" or len(method.getParameterTypes()) != 1:
+                        continue
+                    method.setAccessible(True)
+                    self._set_delegate_unhook = self.hook_method(method, _EmojiSetDelegateHook(self))
+                    break
+                except Exception:
+                    continue
+        except Exception as error:
+            self.log(f"[slowmode_queue] action hook error: {error}")
+
+    def _hook_cells(self):
+        try:
+            chat_message_cell = find_class("org.telegram.ui.Cells.ChatMessageCell")
+            self._hook_named(chat_message_cell, self._chat_cell_unhooks, _ChatMessageCellHook(self), {("setMessageObject", 6)})
+        except Exception as error:
+            self.log(f"[slowmode_queue] cell visual hook error: {error}")
+
+    def _hook_named(self, clazz: Any, storage: List[Any], hook: Any, specs: set):
+        for method in list(clazz.getClass().getDeclaredMethods()):
+            try:
+                signature = (method.getName(), len(method.getParameterTypes()))
+                if signature not in specs:
+                    continue
+                method.setAccessible(True)
+                ref = self.hook_method(method, hook)
+                if ref:
+                    storage.append(ref)
+            except Exception:
+                continue
+
+    def _patch_chat(self):
+        def patch():
+            try:
+                fragment = get_last_fragment()
+                if fragment is None:
+                    return
+
+                get_enter_view = getattr(fragment, "getChatActivityEnterView", None)
+                enter_view = get_enter_view() if callable(get_enter_view) else getattr(fragment, "chatActivityEnterView", None)
+                if enter_view is None:
+                    return
+
+                self._disable_ui(enter_view)
+
+                emoji_view = self._fld_val(enter_view, "emojiView")
+                if emoji_view is None:
+                    return
+
+                delegate = self._fld_val(emoji_view, "delegate")
+                self._hook_emoji(delegate)
+            except Exception as error:
+                self.log(f"[slowmode_queue] current chat patch error: {error}")
+
+        self._ui_sync(patch)
+
+    def _hook_emoji(self, delegate: Any):
+        if delegate is None:
+            return
+
+        try:
+            clazz = delegate.getClass()
+            class_name = str(clazz.getName())
+        except Exception:
+            return
+
+        if class_name in self._hooked_delegate_classes:
+            return
+
+        hook = _SlowmodeBypassHook(self)
+        specs = {
+            ("onStickerSelected", 8),
+            ("onGifSelected", 7),
+            ("onGifSelected", 9),
+        }
+        hooked_any = False
+
+        for method in list(clazz.getDeclaredMethods()):
+            try:
+                signature = (method.getName(), len(method.getParameterTypes()))
+                if signature not in specs:
+                    continue
+                method.setAccessible(True)
+                ref = self.hook_method(method, hook)
+                if ref:
+                    self._delegate_action_unhooks.append(ref)
+                    hooked_any = True
+            except Exception:
+                continue
+
+        if hooked_any:
+            self._hooked_delegate_classes.add(class_name)
+
+    def _prep_send(self, enter_view):
+        try:
+            if not self._active:
+                return
+            if enter_view is None:
+                return
+
+            slow_mode_timer = self._fld_int(enter_view, "slowModeTimer")
+            if slow_mode_timer <= 0 or slow_mode_timer == 2147483647:
+                return
+
+            if not self._view_has_payload(enter_view):
+                return
+
+            self._spoofed_slowmode_timers[id(enter_view)] = slow_mode_timer
+            self._set_int(enter_view, "slowModeTimer", 2147483647)
+        except Exception as error:
+            self.log(f"[slowmode_queue] ui prepare error: {error}")
+
+    def _done_send(self, enter_view):
+        try:
+            if enter_view is None:
+                return
+
+            view_id = id(enter_view)
+            original_timer = self._spoofed_slowmode_timers.pop(view_id, None)
+            if original_timer is None:
+                return
+
+            self._set_int(enter_view, "slowModeTimer", original_timer)
+        except Exception as error:
+            self.log(f"[slowmode_queue] ui finish error: {error}")
+
+    def _prep_timer(self, param: Any):
+        try:
+            enter_view = getattr(param, "thisObject", None)
+            if not self._bypass_ui(enter_view):
+                return
+
+            args = getattr(param, "args", None)
+            if args and len(args) > 0 and int(args[0] or 0) > 0:
+                args[0] = jclass("java.lang.Integer")(0)
+        except Exception as error:
+            self.log(f"[slowmode_queue] timer prepare error: {error}")
+
+    def _done_timer(self, enter_view: Any):
+        try:
+            self._disable_ui(enter_view)
+        except Exception as error:
+            self.log(f"[slowmode_queue] timer finish error: {error}")
+
+    def _bypass_ui(self, enter_view: Any) -> bool:
+        if not self._active or enter_view is None:
+            return False
+
+        is_in_schedule_mode = getattr(enter_view, "isInScheduleMode", None)
+        if callable(is_in_schedule_mode):
+            try:
+                if bool(is_in_schedule_mode()):
+                    return False
+            except Exception:
+                pass
+
+        return True
+
+    def _disable_ui(self, enter_view: Any):
+        if not self._bypass_ui(enter_view):
+            return
+
+        runnable = self._fld_val(enter_view, "updateSlowModeRunnable")
+        if runnable is not None:
+            try:
+                AndroidUtilities.cancelRunOnUIThread(runnable)
+            except Exception:
+                pass
+            self._set_val(enter_view, "updateSlowModeRunnable", None)
+
+        self._set_int(enter_view, "slowModeTimer", 0)
+
+        check_send_button = getattr(enter_view, "checkSendButton", None)
+        if callable(check_send_button):
+            check_send_button(False)
+
+    def _prep_action(self, owner: Any):
+        try:
+            if not self._active:
+                return
+
+            enter_view = self._get_view(owner)
+            if enter_view is None:
+                return
+
+            slow_mode_timer = self._fld_int(enter_view, "slowModeTimer")
+            if slow_mode_timer <= 0 or slow_mode_timer == 2147483647:
+                return
+
+            is_in_schedule_mode = getattr(enter_view, "isInScheduleMode", None)
+            if callable(is_in_schedule_mode) and bool(is_in_schedule_mode()):
+                return
+
+            view_id = id(enter_view)
+            if view_id in self._spoofed_slowmode_timers:
+                return
+
+            self._spoofed_slowmode_timers[view_id] = slow_mode_timer
+            self._set_int(enter_view, "slowModeTimer", 2147483647)
+        except Exception as error:
+            self.log(f"[slowmode_queue] action prepare error: {error}")
+
+    def _done_action(self, owner: Any):
+        try:
+            enter_view = self._get_view(owner)
+            if enter_view is None:
+                return
+
+            view_id = id(enter_view)
+            original_timer = self._spoofed_slowmode_timers.pop(view_id, None)
+            if original_timer is None:
+                return
+
+            self._set_int(enter_view, "slowModeTimer", original_timer)
+        except Exception as error:
+            self.log(f"[slowmode_queue] action finish error: {error}")
+
+    def _find_field(self, obj: Any, field_name: str):
+        if obj is None:
+            return None
+
+        try:
+            clazz = obj.getClass()
+        except Exception:
+            return None
+
+        cache_key = (str(clazz.getName()), field_name)
+        cached = self._field_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        current = clazz
+        while current is not None:
+            try:
+                field = current.getDeclaredField(field_name)
+                field.setAccessible(True)
+                self._field_cache[cache_key] = field
+                return field
+            except Exception:
+                try:
+                    current = current.getSuperclass()
+                except Exception:
+                    current = None
+
+        return None
+
+    def _fld_int(self, obj: Any, field_name: str) -> int:
+        field = self._find_field(obj, field_name)
+        if field is None:
+            return 0
+        try:
+            return int(field.getInt(obj))
+        except Exception:
+            try:
+                value = field.get(obj)
+                return int(value or 0)
+            except Exception:
+                return 0
+
+    def _set_int(self, obj: Any, field_name: str, value: int) -> bool:
+        field = self._find_field(obj, field_name)
+        if field is None:
+            return False
+        try:
+            field.setInt(obj, int(value))
+            return True
+        except Exception:
+            try:
+                integer_class = jclass("java.lang.Integer")
+                field.set(obj, integer_class.valueOf(int(value)))
+                return True
+            except Exception:
+                return False
+
+    def _fld_val(self, obj: Any, field_name: str):
+        field = self._find_field(obj, field_name)
+        if field is None:
+            return None
+        try:
+            return field.get(obj)
+        except Exception:
+            return None
+
+    def _set_val(self, obj: Any, field_name: str, value: Any) -> bool:
+        field = self._find_field(obj, field_name)
+        if field is None:
+            return False
+        try:
+            field.set(obj, value)
+            return True
+        except Exception:
+            return False
+
+    def _fld_bool(self, obj: Any, field_name: str) -> bool:
+        field = self._find_field(obj, field_name)
+        if field is None:
+            return False
+        try:
+            return bool(field.getBoolean(obj))
+        except Exception:
+            try:
+                return bool(field.get(obj))
+            except Exception:
+                return False
+
+    def _get_view(self, owner: Any):
+        current = owner
+        for _ in range(4):
+            if current is None:
+                return None
+            if self._find_field(current, "slowModeTimer") is not None:
+                return current
+            current = self._fld_val(current, "this$0")
+        return None
+
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
+
+    def _parse_int(self, value: Any, default: int = 0) -> int:
+        try:
+            return int(str(value))
+        except Exception:
+            return default
+
+    def _ensure_params_map(self, owner: Any):
+        raw_params = getattr(owner, "params", None)
+        if raw_params is None:
+            raw_params = HashMap()
+            owner.params = raw_params
+        return raw_params
+
+    def _map_put(self, mapping: Any, key: str, value: str):
+        try:
+            mapping.put(key, value)
+        except Exception:
+            mapping[key] = value
+
+    def _map_remove(self, mapping: Any, key: str):
+        try:
+            mapping.remove(key)
+        except Exception:
+            try:
+                mapping.pop(key, None)
+            except Exception:
+                pass
+
+    def _coll_len(self, collection: Any) -> int:
+        if collection is None:
+            return 0
+        try:
+            return int(collection.size())
+        except Exception:
+            try:
+                return len(collection)
+            except Exception:
+                return 0
+
+    def _message_param_int(self, message_object: Any, key: str, default: int = 0) -> int:
+        return self._parse_int(self._message_param(message_object, key), default)
+
+    def _is_dice_text(self, account: int, text: str) -> bool:
+        if not isinstance(text, str):
+            return False
+
+        try:
+            normalized = text.replace("\ufe0f", "")
+            if len(normalized) >= 30:
+                return False
+            return normalized in MessagesController.getInstance(account).diceEmojies
+        except Exception:
+            return False
+
+    def _queue_gap_ms(self, account: int, peer: int) -> int:
+        try:
+            chat_full = MessagesController.getInstance(account).getChatFull(-peer)
+            slowmode_seconds = int(getattr(chat_full, "slowmode_seconds", 0) or 0)
+            if slowmode_seconds > 0:
+                return slowmode_seconds * 1000 + self._safe_delay()
+        except Exception:
+            pass
+        return max(DEFAULT_QUEUE_GAP_MS, 350 + self._safe_delay())
+
+    def _estimate_ready_ms(self, key: Tuple[int, int], entry: QueueEntry) -> int:
+        now_ms = self._now_ms()
+        ready_ms = now_ms + max(0, self._delay_ms(entry.account, entry.peer))
+        queue = self._queues.get(key)
+        if queue:
+            tail_ready = max(int(getattr(queue[-1], "ready_at_ms", 0) or 0), now_ms)
+            ready_ms = max(ready_ms, tail_ready + self._queue_gap_ms(entry.account, entry.peer))
+        return max(now_ms, ready_ms)
+
+    def _mark_visual_window(self, entry: QueueEntry):
+        entry.queued_at_ms = entry.queued_at_ms or self._now_ms()
+        entry.ready_at_ms = max(entry.ready_at_ms, entry.queued_at_ms)
+
+        for owner in (entry.params, getattr(entry.message_object, "messageOwner", None)):
+            if owner is None:
+                continue
+            raw_params = self._ensure_params_map(owner)
+            self._map_put(raw_params, VISUAL_START_KEY, str(entry.queued_at_ms))
+            self._map_put(raw_params, VISUAL_READY_KEY, str(entry.ready_at_ms))
+
+    def _clear_visual_window(self, entry: QueueEntry):
+        for owner in (entry.params, getattr(entry.message_object, "messageOwner", None)):
+            raw_params = getattr(owner, "params", None) if owner is not None else None
+            if raw_params is None:
+                continue
+            self._map_remove(raw_params, VISUAL_START_KEY)
+            self._map_remove(raw_params, VISUAL_READY_KEY)
+
+    def _resolve_from_peer(self, messages_controller: Any, user_config: Any, peer: int):
+        try:
+            chat = messages_controller.getChat(-peer)
+            if chat is not None:
+                chat_full = messages_controller.getChatFull(-peer)
+                send_as_id = int(ChatObject.getSendAsPeerId(chat, chat_full, True) or 0)
+                if send_as_id != 0:
+                    send_as_peer = messages_controller.getPeer(send_as_id)
+                    if send_as_peer is not None:
+                        return send_as_peer
+        except Exception:
+            pass
+
+        user_peer = TLRPC.TL_peerUser()
+        user_peer.user_id = int(user_config.getClientUserId())
+        return user_peer
+
+    def _apply_reply_header(self, message: Any, params: Any, messages_controller: Any):
+        reply_to_story = getattr(params, "replyToStoryItem", None)
+        if reply_to_story is not None:
+            try:
+                reply = TLRPC.TL_messageReplyStoryHeader()
+                reply.story_id = int(getattr(reply_to_story, "id", 0) or 0)
+                story_peer = messages_controller.getPeer(int(getattr(reply_to_story, "dialogId", 0) or 0))
+                if story_peer is not None:
+                    reply.peer = story_peer
+                message.reply_to = reply
+                message.flags |= getattr(TLRPC, "MESSAGE_FLAG_REPLY", 8)
+                return
+            except Exception:
+                pass
+
+        reply_to_msg = getattr(params, "replyToMsg", None)
+        if reply_to_msg is None:
+            return
+
+        try:
+            reply = TLRPC.TL_messageReplyHeader()
+            reply.flags |= 16
+            reply.reply_to_msg_id = int(reply_to_msg.getId())
+
+            reply_to_top = getattr(params, "replyToTopMsg", None)
+            if reply_to_top is not None and reply_to_top != reply_to_msg and int(reply_to_top.getId()) != 1:
+                reply.reply_to_top_id = int(reply_to_top.getId())
+                reply.flags |= 2
+                if bool(getattr(reply_to_top, "isTopicMainMessage", False)):
+                    reply.forum_topic = True
+                    reply.flags |= 8
+            elif bool(getattr(reply_to_msg, "isTopicMainMessage", False)):
+                reply.forum_topic = True
+                reply.flags |= 8
+
+            message.reply_to = reply
+            message.flags |= getattr(TLRPC, "MESSAGE_FLAG_REPLY", 8)
+        except Exception:
+            pass
+
+    def _refresh_message_object(self, entry: QueueEntry):
+        if entry.message_object is None:
+            return
+
+        def refresh():
+            array = ArrayList()
+            array.add(entry.message_object)
+            NotificationCenter.getInstance(entry.account).postNotificationName(NotificationCenter.replaceMessagesObjects, entry.peer, array)
+
+        self._ui_sync(refresh)
+
+    def _set_message_send_error(self, entry: QueueEntry):
+        message_object = entry.message_object
+        owner = getattr(message_object, "messageOwner", None) if message_object is not None else None
+        if owner is None:
+            return
+
+        try:
+            if int(getattr(owner, "send_state", 0) or 0) != MessageObject.MESSAGE_SEND_STATE_SEND_ERROR:
+                owner.send_state = MessageObject.MESSAGE_SEND_STATE_SEND_ERROR
+                if entry.local_id is not None:
+                    NotificationCenter.getInstance(entry.account).postNotificationName(NotificationCenter.messageSendError, int(entry.local_id))
+                else:
+                    self._refresh_message_object(entry)
+        except Exception:
+            pass
+
+    def _release_queued_placeholders(self):
+        with self._condition:
+            entries = list(self._entries_by_marker.values())
+
+        for entry in entries:
+            if entry.waiting_server:
+                continue
+            self._clear_visual_window(entry)
+            self._set_message_send_error(entry)
+
+    def _use_retry_placeholder(self, entry: QueueEntry) -> bool:
+        retry_message_object = getattr(entry.params, "retryMessageObject", None)
+        if retry_message_object is None:
+            return False
+
+        try:
+            local_id = int(retry_message_object.getId())
+        except Exception:
+            return False
+
+        if local_id >= 0:
+            return False
+
+        entry.message_object = retry_message_object
+        entry.local_id = local_id
+        self._mark_visual_window(entry)
+
+        owner = getattr(retry_message_object, "messageOwner", None)
+        if owner is not None:
+            try:
+                owner.send_state = MessageObject.MESSAGE_SEND_STATE_SENDING
+                owner.date = int(entry.ready_at_ms / 1000)
+            except Exception:
+                pass
+
+        with self._condition:
+            self._local_to_marker[(entry.account, local_id)] = entry.marker
+
+        self._refresh_message_object(entry)
+        return True
+
+    def _can_build_placeholder(self, entry: QueueEntry) -> bool:
+        params = entry.params
+        text = getattr(params, "message", None)
+        if isinstance(text, str) and self._is_dice_text(entry.account, text):
+            return False
+
+        entry.is_media = any(
+            getattr(params, field_name, None) is not None
+            for field_name in (
+                "caption",
+                "document",
+                "photo",
+                "location",
+                "poll",
+                "user",
+                "game",
+                "todo",
+                "invoice",
+                "sendingStory",
+            )
+        )
+        return True
+
+    def _build_placeholder_message(self, entry: QueueEntry):
+        params = entry.params
+        caption = getattr(params, "caption", None)
+        text = getattr(params, "message", None)
+        final_text = str(caption) if isinstance(caption, str) else (str(text) if isinstance(text, str) else "")
+
+        try:
+            messages_controller = MessagesController.getInstance(entry.account)
+            user_config = UserConfig.getInstance(entry.account)
+
+            message = TLRPC.TL_message()
+            message.local_id = message.id = int(user_config.getNewMessageId())
+            message.dialog_id = entry.peer
+            message.date = int(entry.ready_at_ms / 1000)
+            message.out = True
+            message.unread = True
+            message.silent = not bool(getattr(params, "notify", True))
+            message.message = final_text
+            message.attachPath = ""
+
+            if getattr(params, "photo", None) is not None:
+                message.media = TLRPC.TL_messageMediaPhoto()
+                message.media.photo = params.photo
+            elif getattr(params, "document", None) is not None:
+                message.media = TLRPC.TL_messageMediaDocument()
+                message.media.document = params.document
+            elif getattr(params, "location", None) is not None:
+                message.media = params.location
+            elif getattr(params, "poll", None) is not None:
+                message.media = params.poll
+            elif getattr(params, "invoice", None) is not None:
+                message.media = params.invoice
+            elif getattr(params, "todo", None) is not None:
+                message.media = params.todo
+            elif getattr(params, "game", None) is not None:
+                message.media = TLRPC.TL_messageMediaGame()
+                message.media.game = params.game
+            elif getattr(params, "user", None) is not None:
+                message.media = TLRPC.TL_messageMediaContact()
+                user = params.user
+                message.media.user_id = int(getattr(user, "id", 0) or 0)
+                message.media.first_name = getattr(user, "first_name", "") or ""
+                message.media.last_name = getattr(user, "last_name", "") or ""
+                message.media.phone_number = getattr(user, "phone", "") or ""
+            elif getattr(params, "mediaWebPage", None) is not None:
+                message.media = params.mediaWebPage
+            elif getattr(params, "webPage", None) is not None:
+                message.media = TLRPC.TL_messageMediaWebPage()
+                message.media.webpage = params.webPage
+            else:
+                message.media = TLRPC.TL_messageMediaEmpty()
+
+            entities = getattr(params, "entities", None)
+            if self._coll_len(entities) > 0:
+                message.entities = entities
+                message.flags |= getattr(TLRPC, "MESSAGE_FLAG_HAS_ENTITIES", 128)
+
+            reply_markup = getattr(params, "replyMarkup", None)
+            if reply_markup is not None:
+                message.reply_markup = reply_markup
+                message.flags |= getattr(TLRPC, "MESSAGE_FLAG_HAS_MARKUP", 64)
+
+            effect_id = int(getattr(params, "effect_id", 0) or 0)
+            if effect_id != 0:
+                message.flags2 |= 4
+                message.effect = effect_id
+
+            peer = messages_controller.getPeer(entry.peer)
+            if peer is None:
+                return None
+
+            message.peer_id = peer
+            message.from_id = self._resolve_from_peer(messages_controller, user_config, entry.peer)
+            message.flags |= getattr(TLRPC, "MESSAGE_FLAG_HAS_FROM_ID", 256)
+            message.flags |= getattr(TLRPC, "MESSAGE_FLAG_HAS_MEDIA", 512)
+
+            self._apply_reply_header(message, params, messages_controller)
+            message.params = self._ensure_params_map(params)
+            message.send_state = MessageObject.MESSAGE_SEND_STATE_SENDING
+
+            message_object = MessageObject(entry.account, message, True, True)
+            message_object.wasJustSent = True
+            message_object.scheduled = False
+
+            reply_to_msg = getattr(params, "replyToMsg", None)
+            if reply_to_msg is not None:
+                try:
+                    message.replyMessage = getattr(reply_to_msg, "messageOwner", None)
+                    message_object.replyMessageObject = reply_to_msg
+                except Exception:
+                    pass
+
+            return message_object
+        except Exception as error:
+            self.log(f"[slowmode_queue] build placeholder error: {error}")
+            return None
+
+    def _insert_placeholder(self, entry: QueueEntry):
+        message_object = self._build_placeholder_message(entry)
+        if message_object is None:
+            return
+
+        entry.message_object = message_object
+        self._mark_visual_window(entry)
+
+        try:
+            entry.local_id = int(message_object.getId())
+        except Exception:
+            entry.local_id = None
+
+        if entry.local_id is not None:
+            with self._condition:
+                self._local_to_marker[(entry.account, entry.local_id)] = entry.marker
+
+        message_owner = getattr(message_object, "messageOwner", None)
+        if message_owner is None:
+            return
+
+        raw_messages = ArrayList()
+        raw_messages.add(message_owner)
+        message_objects = ArrayList()
+        message_objects.add(message_object)
+
+        MessagesStorage.getInstance(entry.account).putMessages(raw_messages, False, True, False, 0, 0, 0)
+        MessagesController.getInstance(entry.account).updateInterfaceWithMessages(entry.peer, message_objects, 0)
+        NotificationCenter.getInstance(entry.account).postNotificationName(NotificationCenter.dialogsNeedReload)
+
+    def _create_placeholder(self, entry: QueueEntry):
+        try:
+            if self._use_retry_placeholder(entry):
+                return
+            if not self._can_build_placeholder(entry):
+                return
+            self._ui_sync(lambda: self._insert_placeholder(entry))
+        except Exception as error:
+            self.log(f"[slowmode_queue] placeholder error: {error}")
+
+    def _apply_cell_visual(self, cell: Any, message_object: Any):
+        if cell is None:
+            return
+
+        alpha = 1.0
+        duration_ms = 0
+
+        if message_object is not None:
+            ready_at_ms = self._message_param_int(message_object, VISUAL_READY_KEY, 0)
+            start_at_ms = self._message_param_int(message_object, VISUAL_START_KEY, 0)
+            if ready_at_ms > start_at_ms > 0:
+                now_ms = self._now_ms()
+                if now_ms < ready_at_ms:
+                    progress = float(now_ms - start_at_ms) / float(max(1, ready_at_ms - start_at_ms))
+                    progress = max(0.0, min(1.0, progress))
+                    alpha = DEFAULT_VISUAL_ALPHA + (1.0 - DEFAULT_VISUAL_ALPHA) * progress
+                    duration_ms = max(MIN_VISUAL_DURATION_MS, ready_at_ms - now_ms)
+
+        animator = getattr(cell, "animate", None)
+        view_animator = animator() if callable(animator) else None
+        if view_animator is not None:
+            try:
+                view_animator.cancel()
+            except Exception:
+                pass
+
+        try:
+            cell.setAlpha(float(alpha))
+        except Exception:
+            return
+
+        if view_animator is not None and duration_ms > 0 and alpha < 0.999:
+            try:
+                view_animator.alpha(1.0).setDuration(int(duration_ms)).start()
+            except Exception:
+                pass
+
+    def _preview(self, params: Any) -> str:
+        for field_name in ("message", "caption"):
+            value = getattr(params, field_name, None)
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    return text
+
+        for field_name, label in (
+            ("document", "[document]"),
+            ("photo", "[photo]"),
+            ("location", "[location]"),
+            ("poll", "[poll]"),
+            ("user", "[contact]"),
+            ("game", "[game]"),
+            ("todo", "[todo]"),
+            ("invoice", "[invoice]"),
+            ("mediaWebPage", "[webpage]"),
+            ("sendingStory", "[story]"),
+        ):
+            if getattr(params, field_name, None) is not None:
+                return label
+
+        return ""
+
+    def _has_payload(self, params: Any) -> bool:
+        if params is None:
+            return False
+
+        if self._preview(params):
+            return True
+
+        return any(
+            getattr(params, field_name, None) is not None
+            for field_name in (
+                "replyToStoryItem",
+                "retryMessageObject",
+                "videoEditedInfo",
+                "webPage",
+                "cover",
+            )
+        )
+
+    def _view_has_payload(self, enter_view: Any) -> bool:
+        has_text_method = getattr(enter_view, "hasText", None)
+        if callable(has_text_method):
+            try:
+                if bool(has_text_method()):
+                    return True
+            except Exception:
+                pass
+
+        try:
+            get_edit_field = getattr(enter_view, "getEditField", None)
+            edit_field = get_edit_field() if callable(get_edit_field) else None
+            get_caption = getattr(edit_field, "getCaption", None)
+            caption = get_caption() if callable(get_caption) else None
+            if caption is not None and str(caption).strip():
+                return True
+        except Exception:
+            pass
+
+        if self._fld_bool(enter_view, "forceShowSendButton"):
+            return True
+
+        return any(
+            self._fld_val(enter_view, field_name) is not None
+            for field_name in ("audioToSend", "videoToSendMessageObject")
+        )
+
+    def _should_queue(self, account: int, peer: int, key: Tuple[int, int]) -> bool:
+        with self._lock:
+            if self._queues.get(key):
+                return True
+        return self._is_waiting(account, peer)
+
+    def _enqueue(self, key: Tuple[int, int], entry: QueueEntry):
+        self._chk_acc(entry.account)
+        need_worker = False
+
+        with self._condition:
+            queue = self._queues.setdefault(key, [])
+            entry.queued_at_ms = self._now_ms()
+            entry.ready_at_ms = self._estimate_ready_ms(key, entry)
+            self._mark_visual_window(entry)
+            queue.append(entry)
+            self._entries_by_marker[entry.marker] = entry
+            if key not in self._worker_keys:
+                self._worker_keys.add(key)
+                need_worker = True
+            self._condition.notify_all()
+            queue_size = len(queue)
+
+        self._create_placeholder(entry)
+
+        if need_worker:
+            threading.Thread(target=self._worker, args=(key,), daemon=True).start()
+
+        if self.get_setting("show_bulletins", DEFAULT_SHOW_BULLETINS):
+            if queue_size <= 1:
+                self._bulletin(tr("queued_single"))
+            else:
+                self._bulletin(tr("queued_many").format(count=queue_size))
+
+    def _worker(self, key: Tuple[int, int]):
+        while True:
+            with self._condition:
+                if not self._active:
+                    self._queues.pop(key, None)
+                    self._worker_keys.discard(key)
+                    return
+
+                queue = self._queues.get(key)
+                if not queue:
+                    self._queues.pop(key, None)
+                    self._worker_keys.discard(key)
+                    return
+
+                entry = queue[0]
+                if entry.waiting_server:
+                    self._condition.wait(timeout=0.5)
+                    continue
+
+                delay_ms = self._delay_ms(entry.account, entry.peer)
+                if delay_ms > 0:
+                    self._condition.wait(timeout=min(delay_ms / 1000.0, 1.0))
+                    continue
+
+                entry.waiting_server = True
+
+            if not self._active:
+                return
+            self._dispatch(entry)
+            if entry.local_id is None:
+                threading.Thread(target=self._wait_id, args=(entry.marker,), daemon=True).start()
+
+    def _dispatch(self, entry: QueueEntry):
+        def send():
+            try:
+                if not self._active:
+                    return
+                self._set_marker(entry)
+                self._clear_visual_window(entry)
+                helper = SendMessagesHelper.getInstance(entry.account)
+                if entry.message_object is not None and entry.local_id is not None and int(entry.local_id) < 0:
+                    if getattr(entry, "is_media", False):
+                        arr = ArrayList()
+                        arr.add(jclass("java.lang.Integer")(int(entry.local_id)))
+                        MessagesController.getInstance(entry.account).deleteMessages(arr, None, None, entry.peer, 0, False, 0)
+                        helper.sendMessage(entry.params)
+                    else:
+                        if not bool(helper.retrySendMessage(entry.message_object, False, 0)):
+                            raise RuntimeError("retrySendMessage returned false")
+                else:
+                    helper.sendMessage(entry.params)
+            except Exception as error:
+                self.log(f"[slowmode_queue] dispatch error: {error}")
+                self._mark_failed(entry.marker)
+
+        self._ui_sync(send)
+
+    def _delay_ms(self, account: int, peer: int) -> int:
+        try:
+            helper = SendMessagesHelper.getInstance(account)
+            if helper.isSendingMessageIdDialog(peer) or helper.isUploadingMessageIdDialog(peer):
+                return 350
+
+            current_time = int(ConnectionsManager.getInstance(account).getCurrentTime())
+            chat_full = MessagesController.getInstance(account).getChatFull(-peer)
+            if chat_full is None:
+                return 0
+
+            next_send = int(getattr(chat_full, "slowmode_next_send_date", 0) or 0)
+            if next_send <= current_time:
+                return 0
+
+            wait_ms = (next_send - current_time) * 1000
+            return wait_ms + self._safe_delay()
+        except Exception as error:
+            self.log(f"[slowmode_queue] ready delay error: {error}")
+            return 500
+
+    def _is_waiting(self, account: int, peer: int) -> bool:
+        try:
+            messages_controller = MessagesController.getInstance(account)
+            chat = messages_controller.getChat(-peer)
+            if chat is None or not bool(getattr(chat, "slowmode_enabled", False)):
+                return False
+            if bool(ChatObject.hasAdminRights(chat)):
+                return False
+
+            helper = SendMessagesHelper.getInstance(account)
+            if helper.isSendingMessageIdDialog(peer) or helper.isUploadingMessageIdDialog(peer):
+                return True
+
+            chat_full = messages_controller.getChatFull(-peer)
+            if chat_full is None:
+                return False
+
+            slowmode_seconds = int(getattr(chat_full, "slowmode_seconds", 0) or 0)
+            next_send = int(getattr(chat_full, "slowmode_next_send_date", 0) or 0)
+            current_time = int(ConnectionsManager.getInstance(account).getCurrentTime())
+            return slowmode_seconds > 0 and next_send > current_time
+        except Exception as error:
+            self.log(f"[slowmode_queue] slowmode state error: {error}")
+            return False
+
+    def _on_notif(self, notification_id, account, *raw_args):
+        try:
+            if not self._active:
+                return
+            args = self._unwrap_args(raw_args)
+            if notification_id == NotificationCenter.didReceiveNewMessages:
+                self._on_new_msgs(int(account), args)
+            elif notification_id in (NotificationCenter.messageReceivedByServer, NotificationCenter.messageReceivedByServer2):
+                self._on_sent(int(account), args)
+            elif notification_id == NotificationCenter.messageSendError:
+                self._on_error(int(account), args)
+        except Exception as error:
+            self.log(f"[slowmode_queue] notification error: {error}")
+
+    def _on_new_msgs(self, account: int, args: Any):
+        if len(args) < 2:
+            return
+
+        for message_object in self._iter_coll(args[1]):
+            if message_object is None:
+                continue
+            try:
+                if not bool(message_object.isOut()):
+                    continue
+            except Exception:
+                continue
+
+            marker = self._message_param(message_object, MARKER_KEY)
+            if marker is None:
+                continue
+
+            with self._condition:
+                entry = self._entries_by_marker.get(marker)
+                if entry is None or entry.account != account:
+                    continue
+                if entry.local_id is not None:
+                    continue
+                try:
+                    local_id = int(message_object.getId())
+                except Exception:
+                    continue
+                entry.local_id = local_id
+                self._local_to_marker[(account, local_id)] = marker
+                self._condition.notify_all()
+
+    def _on_sent(self, account: int, args: Any):
+        if len(args) < 4:
+            return
+
+        try:
+            old_id = int(args[0])
+            did = int(args[3])
+            scheduled = bool(args[6]) if len(args) > 6 else False
+        except Exception:
+            return
+
+        if scheduled:
+            return
+
+        with self._condition:
+            marker = self._local_to_marker.get((account, old_id))
+            if marker is None:
+                queue = self._queues.get((account, did))
+                if queue and queue[0].waiting_server:
+                    marker = queue[0].marker
+                    if queue[0].local_id is None:
+                        queue[0].local_id = old_id
+                        self._local_to_marker[(account, old_id)] = marker
+            if marker is None:
+                return
+            self._finish_entry(marker)
+
+    def _on_error(self, account: int, args: Any):
+        if len(args) < 1:
+            return
+        try:
+            local_id = int(args[0])
+        except Exception:
+            return
+
+        with self._condition:
+            marker = self._local_to_marker.get((account, local_id))
+            if marker is None:
+                return
+
+        self._mark_failed(marker)
+
+    def _finish_entry(self, marker: str):
+        with self._condition:
+            entry = self._entries_by_marker.pop(marker, None)
+            if entry is None:
+                return
+            key = (entry.account, entry.peer)
+            if entry.local_id is not None:
+                self._local_to_marker.pop((entry.account, entry.local_id), None)
+
+            queue = self._queues.get(key)
+            if queue:
+                queue[:] = [item for item in queue if item.marker != marker]
+                if not queue:
+                    self._queues.pop(key, None)
+            self._condition.notify_all()
+
+    def _mark_failed(self, marker: str):
+        with self._condition:
+            entry = self._entries_by_marker.get(marker)
+            if entry is None:
+                return
+        self._set_message_send_error(entry)
+        self._finish_entry(marker)
+        if self.get_setting("show_bulletins", DEFAULT_SHOW_BULLETINS):
+            self._bulletin(tr("send_failed"), "error")
+
+    def _wait_id(self, marker: str):
+        for _ in range(40):
+            time.sleep(0.125)
+
+            with self._lock:
+                entry = self._entries_by_marker.get(marker)
+                if entry is None or entry.local_id is not None:
+                    return
+                account = entry.account
+                peer = entry.peer
+
+            try:
+                local_id = int(SendMessagesHelper.getInstance(account).getSendingMessageId(peer))
+            except Exception:
+                local_id = 0
+
+            if local_id == 0:
+                continue
+
+            with self._condition:
+                entry = self._entries_by_marker.get(marker)
+                if entry is None or entry.local_id is not None:
+                    return
+                entry.local_id = local_id
+                self._local_to_marker[(account, local_id)] = marker
+                self._condition.notify_all()
+                return
+
+    def _set_marker(self, entry: QueueEntry):
+        params = entry.params
+        raw_params = getattr(params, "params", None)
+        if raw_params is None:
+            raw_params = HashMap()
+            params.params = raw_params
+        try:
+            raw_params.put(MARKER_KEY, entry.marker)
+        except Exception:
+            raw_params[MARKER_KEY] = entry.marker
+
+    def _get_marker(self, params: Any) -> Optional[str]:
+        try:
+            raw_params = getattr(params, "params", None)
+            if raw_params is None:
+                return None
+            value = raw_params.get(MARKER_KEY)
+            return None if value is None else str(value)
+        except Exception:
+            return None
+
+    def _is_known(self, marker: str) -> bool:
+        with self._lock:
+            return marker in self._entries_by_marker
+
+    def _chk_delegate(self):
+        if self._delegate is not None:
+            return
+
+        def create():
+            if self._delegate is None:
+                self._delegate = SlowmodeQueueDelegate(self)
+
+        self._ui_sync(create)
+
+    def _chk_acc(self, account: int):
+        with self._lock:
+            if self._delegate is not None and account in self._observed_accounts:
+                return
+
+        self._chk_delegate()
+
+        def add():
+            with self._lock:
+                if self._delegate is None or account in self._observed_accounts:
+                    return
+                delegate = self._delegate
+
+            notification_center = NotificationCenter.getInstance(account)
+            notification_center.addObserver(delegate, NotificationCenter.didReceiveNewMessages)
+            notification_center.addObserver(delegate, NotificationCenter.messageReceivedByServer)
+            notification_center.addObserver(delegate, NotificationCenter.messageReceivedByServer2)
+            notification_center.addObserver(delegate, NotificationCenter.messageSendError)
+
+            with self._lock:
+                self._observed_accounts.add(account)
+
+        self._ui_sync(add)
+
+    def _rm_obs(self):
+        def remove():
+            if self._delegate is None:
+                return
+
+            for account in list(self._observed_accounts):
+                try:
+                    notification_center = NotificationCenter.getInstance(account)
+                    notification_center.removeObserver(self._delegate, NotificationCenter.didReceiveNewMessages)
+                    notification_center.removeObserver(self._delegate, NotificationCenter.messageReceivedByServer)
+                    notification_center.removeObserver(self._delegate, NotificationCenter.messageReceivedByServer2)
+                    notification_center.removeObserver(self._delegate, NotificationCenter.messageSendError)
+                except Exception:
+                    pass
+
+            self._observed_accounts.clear()
+            self._delegate = None
+
+        self._ui_sync(remove)
+
+    def _bulletin(self, text: str, kind: str = "info"):
+        def show():
+            try:
+                getattr(BulletinHelper, f"show_{kind}")(text)
+            except Exception:
+                BulletinHelper.show_info(text)
+
+        run_on_ui_thread(show)
+
+    def _ui_sync(self, fn, timeout_ms: int = 3000):
+        try:
+            if Looper.getMainLooper().isCurrentThread():
+                fn()
+                return
+        except Exception:
+            pass
+
+        finished = threading.Event()
+        error_holder = {}
+
+        def wrapped():
+            try:
+                fn()
+            except Exception as error:
+                error_holder["error"] = error
+            finally:
+                finished.set()
+
+        run_on_ui_thread(wrapped)
+        finished.wait(timeout_ms / 1000.0)
+
+        error = error_holder.get("error")
+        if error is not None:
+            raise error
+
+    def _message_param(self, message_object: Any, key: str) -> Optional[str]:
+        try:
+            owner = getattr(message_object, "messageOwner", None)
+            params = getattr(owner, "params", None) if owner is not None else None
+            if params is None:
+                return None
+            value = params.get(key)
+            return None if value is None else str(value)
+        except Exception:
+            return None
+
+    def _unwrap_args(self, raw_args: Any):
+        if len(raw_args) == 1:
+            candidate = raw_args[0]
+            if hasattr(candidate, "__getitem__") and not isinstance(candidate, (str, bytes)):
+                return candidate
+        return raw_args
+
+    def _iter_coll(self, collection: Any):
+        if collection is None:
+            return []
+        try:
+            return [collection.get(index) for index in range(collection.size())]
+        except Exception:
+            try:
+                return list(collection)
+            except Exception:
+                return []
+
+    def _safe_delay(self) -> int:
+        try:
+            raw = str(self.get_setting("safety_ms", DEFAULT_SAFETY_MS)).strip()
+            value = int(raw)
+        except Exception:
+            value = DEFAULT_SAFETY_MS
+        return max(0, min(5000, value))

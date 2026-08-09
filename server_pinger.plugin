@@ -1,0 +1,290 @@
+"""
+@YouRooni - @RnPlugins
+"""
+
+import weakref
+import time
+import socket
+from typing import Any, List
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from java import dynamic_proxy, jint, jlong
+
+__id__ = "server_pinger_pill"
+__name__ = "Server-Pinger Pill"
+__description__ = "Виджет с мониторингом доступности сервера через HTTP(S)"
+__author__ = "@YouRooni"
+__version__ = "1.0.0"
+__icon__ = "RnDev/1"
+__min_version__ = "12.5.1"
+
+PING_PILL_ID = 3253
+
+class ServerPingerPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.active_pills = weakref.WeakSet()
+        self.last_results = {}
+        self.is_loading = False
+        self.last_update_time = 0
+        self.AndroidUtilities = find_class("org.telegram.messenger.AndroidUtilities")
+        self.PillRegistry = find_class("com.exteragram.messenger.pillstack.core.PillRegistry")
+        self.PillInfo = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillInfo")
+        self.PillCreator = find_class("com.exteragram.messenger.pillstack.core.PillRegistry$PillCreator")
+        self.PillStackConfig = find_class("com.exteragram.messenger.pillstack.core.PillStackConfig")
+        self.WeatherPill = find_class("com.exteragram.messenger.pillstack.ui.pills.weather.WeatherPill")
+        self.ApplicationLoader = find_class("org.telegram.messenger.ApplicationLoader")
+
+    def on_plugin_load(self):
+        if not self.PillRegistry: return
+        TAG_KEY = jint(0x50494C4C)
+        self._currently_creating = False
+
+        class PingerCreator(dynamic_proxy(self.PillCreator)):
+            def __init__(self, plugin):
+                super().__init__()
+                self.plugin = plugin
+            def create(self, context, resourcesProvider):
+                try:
+                    self.plugin._currently_creating = True
+                    pill = self.plugin.WeatherPill(context, resourcesProvider)
+                    self.plugin._currently_creating = False
+                    pill.setTag(TAG_KEY, jint(PING_PILL_ID))
+                    self.plugin.active_pills.add(pill)
+                    self.plugin.schedule_update(pill)
+                    return pill
+                except Exception as e:
+                    self.plugin._currently_creating = False
+                    self.plugin.log(f"ошибка создания пингера: {e}")
+                    return None
+
+        try:
+            ctx = self.ApplicationLoader.applicationContext
+            res = ctx.getResources()
+            icon_res = res.getIdentifier("msg_filled_data_received", "drawable", ctx.getPackageName())
+            
+            pill_info = self.PillInfo(
+                jint(PING_PILL_ID), 
+                "Server Pinger", 
+                jint(icon_res), 
+                jint(-11565578), 
+                jint(-13276952), 
+                PingerCreator(self)
+            )
+            self.PillRegistry.register(pill_info)
+            
+            class GetIdHook(MethodHook):
+                def __init__(self, plugin):
+                    super().__init__()
+                    self.plugin = plugin
+                def before_hooked_method(self, param):
+                    tag = param.thisObject.getTag(TAG_KEY)
+                    is_mine = (tag and int(tag) == PING_PILL_ID) or self.plugin._currently_creating
+                    if is_mine:
+                        if not tag: param.thisObject.setTag(TAG_KEY, jint(PING_PILL_ID))
+                        self.plugin.active_pills.add(param.thisObject)
+                        param.setResult(jint(PING_PILL_ID))
+
+            class InteractionHook(MethodHook):
+                def __init__(self, plugin):
+                    super().__init__()
+                    self.plugin = plugin
+                def before_hooked_method(self, param):
+                    tag = param.thisObject.getTag(TAG_KEY)
+                    is_mine = (tag and int(tag) == PING_PILL_ID) or self.plugin._currently_creating
+                    if is_mine:
+                        if not tag: param.thisObject.setTag(TAG_KEY, jint(PING_PILL_ID))
+                        method_name = param.method.getName()
+                        if method_name == "onPillClicked":
+                            self.plugin.force_update(param.thisObject, manual=True)
+                            param.setResult(None)
+                        elif method_name == "onPillLongClicked":
+                            self.plugin.show_pill_menu(param.thisObject)
+                            param.setResult(True)
+                        elif method_name in ["onUpdateData", "setData"]:
+                            param.setResult(None)
+
+            self.hook_all_methods(self.WeatherPill, "getPillId", GetIdHook(self))
+            self.hook_all_methods(self.WeatherPill, "onPillClicked", InteractionHook(self))
+            self.hook_all_methods(self.WeatherPill, "onPillLongClicked", InteractionHook(self))
+            self.hook_all_methods(self.WeatherPill, "onUpdateData", InteractionHook(self))
+            self.hook_all_methods(self.WeatherPill, "setData", InteractionHook(self))
+
+            if self.PillStackConfig:
+                active = self.PillStackConfig.activePills
+                is_active = False
+                for i in range(active.size()):
+                    if int(active.get(i)) == PING_PILL_ID:
+                        is_active = True
+                        break
+                if not is_active:
+                    active.add(jint(PING_PILL_ID))
+                    self.PillStackConfig.savePillsLayout()
+                    run_on_ui_thread(self.PillStackConfig.notifySettingsChanged)
+        except Exception as e:
+            self.log(f"ошибка реги пингера: {e}")
+
+    def show_pill_menu(self, pill):
+        try:
+            LaunchActivity = find_class("org.telegram.ui.LaunchActivity")
+            fragment = LaunchActivity.getSafeLastFragment()
+            if not fragment: return
+            ItemOptions = find_class("org.telegram.ui.Components.ItemOptions")
+            ctx = self.ApplicationLoader.applicationContext
+            res = ctx.getResources()
+            pkg = ctx.getPackageName()
+            icon_refresh = res.getIdentifier("msg_retry", "drawable", pkg)
+            icon_settings = res.getIdentifier("msg_settings", "drawable", pkg)
+            icon_link = res.getIdentifier("msg_link", "drawable", pkg)
+            options = ItemOptions.makeOptions(fragment, pill)
+            
+            class RefreshRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
+                def __init__(self, plugin, p):
+                    super().__init__()
+                    self.plugin = plugin
+                    self.p = p
+                def run(self):
+                    self.plugin.force_update(self.p, manual=True)
+
+            class OpenUrlRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
+                def __init__(self, plugin):
+                    super().__init__()
+                    self.plugin = plugin
+                def run(self):
+                    try:
+                        target_url = self.plugin.get_setting("target_url", "https://google.com")
+                        if not target_url.startswith("http"): target_url = "https://" + target_url
+                        from android.net import Uri
+                        from android.content import Intent
+                        intent = Intent(Intent.ACTION_VIEW, Uri.parse(target_url))
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        self.plugin.ApplicationLoader.applicationContext.startActivity(intent)
+                    except Exception as e:
+                        self.plugin.log(f"ошибка открытия ссылки: {e}")
+            
+            class PluginSettingsRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
+                def __init__(self, plugin):
+                    super().__init__()
+                    self.plugin = plugin
+                def run(self):
+                    try:
+                        from com.exteragram.messenger.plugins import PluginsController
+                        PluginSettingsActivity = find_class("com.exteragram.messenger.plugins.ui.PluginSettingsActivity")
+                        java_plugin = PluginsController.getInstance().plugins.get(self.plugin.id)
+                        if java_plugin:
+                            from client_utils import get_last_fragment
+                            get_last_fragment().presentFragment(PluginSettingsActivity(java_plugin))
+                    except Exception: pass
+
+            class CommonSettingsRunnable(dynamic_proxy(find_class("java.lang.Runnable"))):
+                def run(self):
+                    PillStackPreferencesActivity = find_class("com.exteragram.messenger.pillstack.ui.PillStackPreferencesActivity")
+                    from client_utils import get_last_fragment
+                    get_last_fragment().presentFragment(PillStackPreferencesActivity())
+
+            options.add(jint(icon_refresh), "Обновить", RefreshRunnable(self, pill))
+            options.add(jint(icon_link), "Открыть страницу", OpenUrlRunnable(self))
+            options.addGap()
+            options.add(jint(icon_settings), "Настройки виджета", PluginSettingsRunnable(self))
+            options.add(jint(icon_settings), "Настройки", CommonSettingsRunnable())
+            options.setDrawScrim(False).setDimAlpha(jint(0)).show()
+        except Exception as e:
+            self.log(f"ошибка меню: {e}")
+
+    def schedule_update(self, pill):
+        if not pill: return
+        self.force_update(pill)
+        
+        def tick():
+            if pill in self.active_pills:
+                self.force_update(pill)
+                interval = int(self.get_setting("update_interval", 10)) * 1000
+                run_on_ui_thread(tick, delay=interval)
+        
+        interval = int(self.get_setting("update_interval", 10)) * 1000
+        run_on_ui_thread(tick, delay=interval)
+
+    def check_server(self):
+        target_url = self.get_setting("target_url", "https://google.com")
+        timeout = int(self.get_setting("timeout", 5))
+        if not target_url.startswith("http"):
+            target_url = "https://" + target_url
+        try:
+            import urllib.request as urllib2
+            start = time.time()
+            req = urllib2.Request(target_url, headers={'User-Agent': 'Mozilla/5.0'})
+            response = urllib2.urlopen(req, timeout=timeout)
+            code = response.getcode()
+            ping = int((time.time() - start) * 1000)
+            return code, ping
+        except Exception:
+            return 0, 0
+
+    def force_update(self, pill, manual=False):
+        now = time.time()
+        
+        cached = self.last_results.get("data")
+        if cached:
+            self.apply_ui(pill, cached[0], cached[1])
+        
+        if self.is_loading and (now - self.last_update_time) < 10:
+            return
+            
+        if not manual and (now - self.last_update_time) < 5:
+            return
+            
+        import threading
+        self.is_loading = True
+        self.last_update_time = now
+        run_on_ui_thread(lambda: self.start_pill_loading(pill))
+        threading.Thread(target=lambda: self._update_logic(pill)).start()
+
+    def start_pill_loading(self, pill):
+        try:
+            pill.startLoading()
+        except Exception: pass
+
+    def _update_logic(self, pill):
+        code, ping = self.check_server()
+        self.is_loading = False
+        self.last_results["data"] = (code, ping)
+        run_on_ui_thread(lambda: self.apply_ui(pill, code, ping))
+
+    def apply_ui(self, pill, code, ping):
+        try:
+            pill.stopLoading()
+            tv = get_private_field(pill, "textView")
+            if tv:
+                dot = "●"
+                status_color = "#4CAF50" if code == 200 else "#F44336"
+                from android.text import SpannableStringBuilder, SpannableString
+                from android.text.style import ForegroundColorSpan
+                from android.graphics import Color
+                builder = SpannableStringBuilder()
+                span_dot = SpannableString(f"{dot} ")
+                span_dot.setSpan(ForegroundColorSpan(Color.parseColor(status_color)), 0, 1, 33)
+                builder.append(span_dot)
+                if code == 0:
+                    builder.append("Offline")
+                else:
+                    builder.append(f"{ping} ms")
+                tv.setText(builder)
+            iv = get_private_field(pill, "iconView")
+            if iv: iv.setVisibility(jint(8))
+            layout = get_private_field(pill, "layout")
+            if layout:
+                pad = self.AndroidUtilities.dp(8.0)
+                layout.setPadding(pad, 0, pad, 0)
+        except Exception as e:
+            self.log(f"ошибка отрисовки: {e}")
+
+    def create_settings(self) -> List[Any]:
+        from ui.settings import Header, Input
+        return [
+            Header("Server Pinger"),
+            Input("target_url", "URL для проверки", "https://google.com", icon="msg_language", on_change=lambda v: self.set_setting("target_url", v)),
+            Input("update_interval", "Интервал (сек)", "10", on_change=lambda v: self.set_setting("update_interval", v)),
+            Input("timeout", "Таймаут (сек)", "5", on_change=lambda v: self.set_setting("timeout", v))
+        ]
